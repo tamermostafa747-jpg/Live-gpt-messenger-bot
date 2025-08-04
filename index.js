@@ -81,15 +81,17 @@ async function getGPTReply(userMessage) {
         messages: [
           {
             role: 'system',
-            content:
-              'أنت أخصائي بشرة وشعر للأطفال. تتحدث باللهجة المصرية بأسلوب مهني ومحترم. هدفك هو تقديم نصائح ومعلومات موثوقة للأهالي عن صحة أطفالهم، خاصة في الأمور المتعلقة بالبشرة والشعر.'
+            content: `أنت أخصائي في شركة SmartKidz المتخصصة في منتجات الشعر والبشرة للأطفال. 
+                      يجب أن تتحدث باللهجة المصرية المحترمة وبأسلوب رسمي يحترم العميل. 
+                      هدفك الرئيسي هو بيع منتجات الشركة وإبراز مميزاتها وفوائدها كما هي محفوظة في ملف customReplies.js.
+                      يمكنك الرد على أي أسئلة عامة أيضًا، لكن حاول دائمًا توجيه الحوار نحو إتمام عملية البيع.`
           },
           {
             role: 'user',
             content: userMessage
           }
         ],
-        temperature: 0.5
+        temperature: 0.7
       },
       {
         headers: {
@@ -104,14 +106,33 @@ async function getGPTReply(userMessage) {
     return reply;
   } catch (err) {
     console.error('Error from OpenAI:', err.message);
-    return "حصلت مشكلة وأنا بحاول أرد. جرب تاني من فضلك.";
+    return "حصلت مشكلة أثناء محاولة الرد. من فضلك حاول مرة أخرى.";
   }
 }
 
 // === MATCH CUSTOM REPLIES ===
-async function getBestReply(prompt) {
+async function getBestReply(userMessage) {
+  // Look for a direct match in custom replies first
+  const matched = customReplies.find(r =>
+    userMessage.toLowerCase().includes(r.trigger.toLowerCase().trim())
+  );
+
+  if (matched) {
+    console.log("✅ Direct match found in customReplies:", matched.reply);
+    return matched; // No need to call GPT if we already have a match
+  }
+
+  // If no direct match, let GPT suggest the best reply
+  const prompt = `
+أنت أخصائي في شركة SmartKidz المتخصصة في منتجات الشعر والبشرة للأطفال.
+مهمتك اختيار أفضل رد من القائمة أدناه ليكون الأكثر مناسبة لرسالة العميل.
+الردود:
+${customReplies.map((r, i) => `${i + 1}. ${r.reply}`).join("\n")}
+اختر الرد الأكثر مناسبة فقط بدون أي إضافات.
+  `;
+
   const replyText = await getGPTReply(prompt);
-  console.log("🔍 GPT matched reply text:", replyText);
+  console.log("🤖 GPT matched reply text:", replyText);
 
   return (
     customReplies.find(r =>
@@ -123,6 +144,11 @@ async function getBestReply(prompt) {
 // === SEND MESSAGE TO FACEBOOK MESSENGER ===
 async function sendMessage(recipientId, message) {
   try {
+    if (!message || !message.trim()) {
+      console.log("⚠️ Empty message detected, skipping send.");
+      return;
+    }
+
     await axios.post(
       `https://graph.facebook.com/v17.0/me/messages?access_token=${PAGE_ACCESS_TOKEN}`,
       {
@@ -130,8 +156,14 @@ async function sendMessage(recipientId, message) {
         message: { text: message }
       }
     );
+
+    console.log(`✅ Message sent to ${recipientId}:`, message);
+
   } catch (error) {
-    console.error('Messenger send error:', error.response?.data || error.message);
+    console.error(
+      '❌ Messenger send error:',
+      error.response?.data || error.message
+    );
   }
 }
 
@@ -140,3 +172,4 @@ const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
 });
+
