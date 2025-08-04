@@ -1,4 +1,5 @@
 const customReplies = require('./customReplies');
+
 // GPT-Messenger Bot - index.js
 
 const express = require('express');
@@ -47,25 +48,26 @@ app.post('/webhook', async (req, res) => {
             return;
           }
 
-          const userMessage = event.message.text;
+          if (event.message && event.message.text) {
+            const userMessage = event.message.text;
 
-          // 1. Try custom replies
-          const matchedReply = await getBestReply(userMessage);
+            // 1. Try custom replies
+            const matchedReply = await getBestReply(userMessage);
 
-          // 2. Use GPT if no match found
-          const finalReply = matchedReply ? matchedReply.reply : await getGPTReply(userMessage);
-          console.log("Sending final reply:", finalReply);
+            // 2. Use GPT if no match found
+            const finalReply = matchedReply?.reply || await getGPTReply(userMessage);
+            console.log("Sending final reply:", finalReply);
 
-          await sendMessage(senderId, finalReply);
+            await sendMessage(senderId, finalReply);
 
-          // ✅ Prevent further looping after a successful message
-          return;
+            // ✅ Prevent further looping after a successful message
+            return;
+          }
         }
       }
-
-      return res.sendStatus(200);
+      res.sendStatus(200);
     } else {
-      return res.sendStatus(404);
+      res.sendStatus(404);
     }
   } catch (err) {
     console.error('Webhook error:', err.message);
@@ -79,40 +81,46 @@ async function getGPTReply(userMessage) {
     const response = await axios.post(
       OPENAI_API_URL,
       {
-        model: 'gpt-4o',
-        messages: [{ role: 'user', content: userMessage }]
+        model: 'gpt-3.5-turbo',
+        messages: [
+          {
+            role: 'system',
+            content: 'أنت مساعد ذكي ترد على الرسائل باللهجة المصرية بشكل ودود وسهل الفهم.'
+          },
+          {
+            role: 'user',
+            content: userMessage
+          }
+        ],
+        temperature: 0.7
       },
       {
         headers: {
-          Authorization: `Bearer ${OPENAI_API_KEY}`,
-          'Content-Type': 'application/json'
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${OPENAI_API_KEY}`
         }
       }
     );
-    return response.data.choices[0].message.content.trim();
-  } catch (error) {
-    console.error('GPT API error:', error.response?.data || error.message);
-    return 'Sorry, something went wrong.';
+
+    const reply = response.data.choices[0].message.content;
+    console.log("🤖 GPT reply:", reply);
+    return reply;
+  } catch (err) {
+    console.error('Error from OpenAI:', err.message);
+    return "حصلت مشكلة وأنا بحاول أرد. جرب تاني من فضلك.";
   }
 }
 
-// === GET BEST CUSTOM REPLY ===
-async function getBestReply(messageText) {
-  const prompt = `
-You are a helpful assistant. A user said: "${messageText}".
-Select the best matching reply based on the list below.
-
-${customReplies.map((r, i) => `${i + 1}. ${r.trigger} (${r.context}): ${r.reply}`).join("\n")}
-
-Reply only with the best full reply from the list.
-`;
-
+// === MATCH CUSTOM REPLIES ===
+async function getBestReply(prompt) {
   const replyText = await getGPTReply(prompt);
   console.log("GPT matched reply text:", replyText);
 
-  return customReplies.find(r =>
-    replyText.toLowerCase().includes(r.reply.toLowerCase().trim())
-  ) || null;
+  return (
+    customReplies.find(r =>
+      replyText.toLowerCase().includes(r.reply.toLowerCase().trim())
+    ) || null
+  );
 }
 
 // === SEND MESSAGE TO FACEBOOK MESSENGER ===
@@ -130,5 +138,8 @@ async function sendMessage(recipientId, message) {
   }
 }
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+// === START SERVER ===
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => {
+  console.log(`🚀 Server running on port ${PORT}`);
+});
