@@ -1,3 +1,4 @@
+const customReplies = require('./customReplies');
 // GPT-Messenger Bot - index.js
 
 const express = require('express');
@@ -31,26 +32,44 @@ app.get('/webhook', (req, res) => {
 
 // === HANDLE INCOMING MESSAGES ===
 app.post('/webhook', async (req, res) => {
-  const body = req.body;
+  try {
+    const body = req.body;
 
-  if (body.object === 'page') {
-    for (const entry of body.entry) {
-      for (const event of entry.messaging) {
+    if (body.object === 'page') {
+      for (const entry of body.entry) {
+        for (const event of entry.messaging) {
+          console.log('📩 Incoming event:', event);
 
-        console.log('📨 Incoming event:', event);
+          const senderId = event.sender.id;
 
-        const senderId = event.sender.id;
+          if (!event.message || !event.message.text) {
+            console.log("Unsupported or empty message received.");
+            return;
+          }
 
-        if (event.message && event.message.text) {
           const userMessage = event.message.text;
-          const reply = await getGPTReply(userMessage);
-          await sendMessage(senderId, reply);
+
+          // 1. Try custom replies
+          const matchedReply = await getBestReply(userMessage);
+
+          // 2. Use GPT if no match found
+          const finalReply = matchedReply ? matchedReply.reply : await getGPTReply(userMessage);
+          console.log("Sending final reply:", finalReply);
+
+          await sendMessage(senderId, finalReply);
+
+          // ✅ Prevent further looping after a successful message
+          return;
         }
       }
+
+      return res.sendStatus(200);
+    } else {
+      return res.sendStatus(404);
     }
-    res.sendStatus(200);
-  } else {
-    res.sendStatus(404);
+  } catch (err) {
+    console.error('Webhook error:', err.message);
+    res.sendStatus(500);
   }
 });
 
@@ -75,6 +94,25 @@ async function getGPTReply(userMessage) {
     console.error('GPT API error:', error.response?.data || error.message);
     return 'Sorry, something went wrong.';
   }
+}
+
+// === GET BEST CUSTOM REPLY ===
+async function getBestReply(messageText) {
+  const prompt = `
+You are a helpful assistant. A user said: "${messageText}".
+Select the best matching reply based on the list below.
+
+${customReplies.map((r, i) => `${i + 1}. ${r.trigger} (${r.context}): ${r.reply}`).join("\n")}
+
+Reply only with the best full reply from the list.
+`;
+
+  const replyText = await getGPTReply(prompt);
+  console.log("GPT matched reply text:", replyText);
+
+  return customReplies.find(r =>
+    replyText.toLowerCase().includes(r.reply.toLowerCase().trim())
+  ) || null;
 }
 
 // === SEND MESSAGE TO FACEBOOK MESSENGER ===
