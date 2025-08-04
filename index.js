@@ -48,10 +48,11 @@ app.post('/webhook', async (req, res) => {
             continue;
           }
 
-          const userMessage = event.message.text;
+          const userMessage = event.message.text.trim();
+          if (!userMessage) continue;
 
           // 1. Try custom replies
-          const matchedReply = await getBestReply(userMessage);
+          const matchedReply = getBestReply(userMessage);
 
           // 2. Use GPT if no custom match
           const finalReply = matchedReply?.reply || await getGPTReply(userMessage);
@@ -74,6 +75,9 @@ app.post('/webhook', async (req, res) => {
 // === GET GPT REPLY ===
 async function getGPTReply(userMessage) {
   try {
+    // Add all product info from customReplies for GPT context
+    const productInfo = customReplies.map((r, i) => `${i + 1}. ${r.trigger}: ${r.reply}`).join("\n");
+
     const response = await axios.post(
       OPENAI_API_URL,
       {
@@ -81,10 +85,12 @@ async function getGPTReply(userMessage) {
         messages: [
           {
             role: 'system',
-            content: `أنت أخصائي في شركة SmartKidz المتخصصة في منتجات الشعر والبشرة للأطفال. 
-                      يجب أن تتحدث باللهجة المصرية المحترمة وبأسلوب رسمي يحترم العميل. 
-                      هدفك الرئيسي هو بيع منتجات الشركة وإبراز مميزاتها وفوائدها كما هي محفوظة في ملف customReplies.js.
-                      يمكنك الرد على أي أسئلة عامة أيضًا، لكن حاول دائمًا توجيه الحوار نحو إتمام عملية البيع.`
+            content: `أنت أخصائي في شركة SmartKidz المتخصصة في منتجات الشعر والبشرة للأطفال.
+                      يجب أن تتحدث باللهجة المصرية الرسمية المحترمة التي تحترم العميل.
+                      هدفك الرئيسي هو بيع منتجات الشركة وإبراز مميزاتها وفوائدها.
+                      هذه قائمة بالردود والمعلومات المتوفرة:
+                      ${productInfo}
+                      إذا كان أي جزء من السؤال يطابق هذه المعلومات، استخدمها كما هي في ردك.`
           },
           {
             role: 'user',
@@ -110,32 +116,13 @@ async function getGPTReply(userMessage) {
   }
 }
 
-// === MATCH CUSTOM REPLIES ===
-async function getBestReply(userMessage) {
-  // Ask GPT to classify if this message matches a saved reply
-  const classificationPrompt = `
-أنت أخصائي في شركة SmartKidz لمنتجات العناية بالشعر والبشرة للأطفال.
-تحدث باللهجة المصرية الرسمية باحترام.
-قم بالتحقق إذا كانت الرسالة التالية تطابق أي رد من الردود المحفوظة في قاعدة البيانات:
-
-${customReplies.map((r, i) => `${i + 1}. ${r.trigger}: ${r.reply}`).join("\n")}
-
-إذا وجدت تطابق دقيق، أعطيني رقم الرد فقط. إذا لم يوجد تطابق دقيق، أجب بـ "لا".
-الرسالة: "${userMessage}"
-  `;
-
-  const classification = await getGPTReply(classificationPrompt);
-
-  if (classification && /^\d+$/.test(classification.trim())) {
-    // Exact match found, return from custom replies
-    const index = parseInt(classification.trim(), 10) - 1;
-    if (customReplies[index]) {
-      return { reply: customReplies[index].reply };
-    }
-  }
-
-  // No exact match, return null so main handler uses GPT freeform answer
-  return null;
+// === MATCH CUSTOM REPLIES DIRECTLY ===
+function getBestReply(userMessage) {
+  const lowerMsg = userMessage.toLowerCase();
+  const match = customReplies.find(r =>
+    lowerMsg.includes(r.trigger.toLowerCase())
+  );
+  return match ? { reply: match.reply } : null;
 }
 
 // === SEND MESSAGE TO FACEBOOK MESSENGER ===
@@ -169,5 +156,3 @@ const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
 });
-
-
