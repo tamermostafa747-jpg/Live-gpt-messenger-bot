@@ -45,29 +45,25 @@ app.post('/webhook', async (req, res) => {
 
           if (!event.message || !event.message.text) {
             console.log("Unsupported or empty message received.");
-            return;
+            continue;
           }
 
-          if (event.message && event.message.text) {
-            const userMessage = event.message.text;
+          const userMessage = event.message.text;
 
-            // 1. Try custom replies
-            const matchedReply = await getBestReply(userMessage);
+          // 1. Try custom replies
+          const matchedReply = await getBestReply(userMessage);
 
-            // 2. Use GPT if no match found
-            const finalReply = matchedReply?.reply || await getGPTReply(userMessage);
-            console.log("Sending final reply:", finalReply);
+          // 2. Use GPT if no custom match
+          const finalReply = matchedReply?.reply || await getGPTReply(userMessage);
 
-            await sendMessage(senderId, finalReply);
-
-            // ✅ Prevent further looping after a successful message
-            return;
-          }
+          console.log("✅ Final reply:", finalReply);
+          await sendMessage(senderId, finalReply);
         }
       }
-      res.sendStatus(200);
+
+      return res.sendStatus(200);
     } else {
-      res.sendStatus(404);
+      return res.sendStatus(404);
     }
   } catch (err) {
     console.error('Webhook error:', err.message);
@@ -85,14 +81,15 @@ async function getGPTReply(userMessage) {
         messages: [
           {
             role: 'system',
-            content: 'أنت مساعد ذكي ترد على الرسائل باللهجة المصرية بشكل ودود وسهل الفهم.'
+            content:
+              'أنت أخصائي بشرة وشعر للأطفال. تتحدث باللهجة المصرية بأسلوب مهني ومحترم. هدفك هو تقديم نصائح ومعلومات موثوقة للأهالي عن صحة أطفالهم، خاصة في الأمور المتعلقة بالبشرة والشعر.'
           },
           {
             role: 'user',
             content: userMessage
           }
         ],
-        temperature: 0.7
+        temperature: 0.5
       },
       {
         headers: {
@@ -114,7 +111,7 @@ async function getGPTReply(userMessage) {
 // === MATCH CUSTOM REPLIES ===
 async function getBestReply(prompt) {
   const replyText = await getGPTReply(prompt);
-  console.log("GPT matched reply text:", replyText);
+  console.log("🔍 GPT matched reply text:", replyText);
 
   return (
     customReplies.find(r =>
