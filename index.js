@@ -112,33 +112,30 @@ async function getGPTReply(userMessage) {
 
 // === MATCH CUSTOM REPLIES ===
 async function getBestReply(userMessage) {
-  // Look for a direct match in custom replies first
-  const matched = customReplies.find(r =>
-    userMessage.toLowerCase().includes(r.trigger.toLowerCase().trim())
-  );
+  // Ask GPT to classify if this message matches a saved reply
+  const classificationPrompt = `
+أنت أخصائي في شركة SmartKidz لمنتجات العناية بالشعر والبشرة للأطفال.
+تحدث باللهجة المصرية الرسمية باحترام.
+قم بالتحقق إذا كانت الرسالة التالية تطابق أي رد من الردود المحفوظة في قاعدة البيانات:
 
-  if (matched) {
-    console.log("✅ Direct match found in customReplies:", matched.reply);
-    return matched; // No need to call GPT if we already have a match
-  }
+${customReplies.map((r, i) => `${i + 1}. ${r.trigger}: ${r.reply}`).join("\n")}
 
-  // If no direct match, let GPT suggest the best reply
-  const prompt = `
-أنت أخصائي في شركة SmartKidz المتخصصة في منتجات الشعر والبشرة للأطفال.
-مهمتك اختيار أفضل رد من القائمة أدناه ليكون الأكثر مناسبة لرسالة العميل.
-الردود:
-${customReplies.map((r, i) => `${i + 1}. ${r.reply}`).join("\n")}
-اختر الرد الأكثر مناسبة فقط بدون أي إضافات.
+إذا وجدت تطابق دقيق، أعطيني رقم الرد فقط. إذا لم يوجد تطابق دقيق، أجب بـ "لا".
+الرسالة: "${userMessage}"
   `;
 
-  const replyText = await getGPTReply(prompt);
-  console.log("🤖 GPT matched reply text:", replyText);
+  const classification = await getGPTReply(classificationPrompt);
 
-  return (
-    customReplies.find(r =>
-      replyText.toLowerCase().includes(r.reply.toLowerCase().trim())
-    ) || null
-  );
+  if (classification && /^\d+$/.test(classification.trim())) {
+    // Exact match found, return from custom replies
+    const index = parseInt(classification.trim(), 10) - 1;
+    if (customReplies[index]) {
+      return { reply: customReplies[index].reply };
+    }
+  }
+
+  // No exact match, return null so main handler uses GPT freeform answer
+  return null;
 }
 
 // === SEND MESSAGE TO FACEBOOK MESSENGER ===
@@ -172,4 +169,5 @@ const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
 });
+
 
