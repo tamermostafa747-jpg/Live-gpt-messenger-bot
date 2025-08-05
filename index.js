@@ -43,21 +43,24 @@ app.post('/webhook', async (req, res) => {
 
           const senderId = event.sender.id;
 
-          if (!event.message || !event.message.text) {
-            console.log("Unsupported or empty message received.");
+          // Ignore non-text events like delivery receipts or read confirmations
+          if (!event.message || !event.message.text || event.delivery || event.read) {
             continue;
           }
 
           const userMessage = event.message.text.trim();
           if (!userMessage) continue;
 
-          // 1. Try custom replies
+          // 1. Try custom replies (exact match first, then partial)
           const matchedReply = getBestReply(userMessage);
 
-          // 2. Use GPT if no custom match
+          // 2. If no custom reply, use GPT
           const finalReply = matchedReply?.reply || await getGPTReply(userMessage);
 
           console.log("✅ Final reply:", finalReply);
+
+          await sendTypingOn(senderId);
+          await new Promise(res => setTimeout(res, 1500)); // Simulate thinking
           await sendMessage(senderId, finalReply);
         }
       }
@@ -72,32 +75,39 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-// === GET GPT REPLY (Locked Egyptian Sales Style) ===
+// === GET GPT REPLY (Professional Egyptian Sales Style) ===
 async function getGPTReply(userMessage) {
   try {
     const response = await axios.post(
       OPENAI_API_URL,
       {
-        model: 'gpt-3.5-turbo',
+        model: 'gpt-4o-mini',
         messages: [
           {
             role: 'system',
             content: `
-أنت أخصائي في شركة SmartKidz المتخصصة في منتجات العناية بالشعر والبشرة للأطفال. 
-تتحدث باللهجة المصرية الخالصة وبأسلوب محترم ورسمي لكن ودود، مع استخدام تعبيرات مألوفة للأهالي في مصر. 
-هدفك الأساسي هو بيع منتجات SmartKidz وإبراز مميزاتها وفوائدها، كما هي محفوظة في ملف customReplies.js، 
-وتحاول دائمًا ربط أي إجابة بمنتج من منتجات الشركة حتى لو السؤال عام. 
-إذا كان السؤال عن الشعر أو البشرة للأطفال، قدم نصائح بسيطة وأدرج منتج من منتجات الشركة كجزء من الحل. 
-ابتعد تمامًا عن اللغة الفصحى أو المصطلحات الغريبة، واستخدم كلمات سهلة وعملية. 
-حافظ على أن يكون كلامك قصير ومباشر ويشجع العميل على الشراء أو التجربة.
-          `
+أنت أخصائي مبيعات وخبير استشارات في شركة SmartKidz المتخصصة في منتجات العناية بالشعر والبشرة للأطفال. 
+تتحدث باللهجة المصرية الرسمية والمحترمة، مع لمسة ود ودافئ، بدون أي عبارات عامية مبالغ فيها أو مصطلحات غير مألوفة.
+هدفك الأساسي هو بيع منتجات SmartKidz وإبراز فوائدها ومميزاتها كما هي محفوظة في ملف customReplies.js، 
+مع تقديم معلومات علمية موثوقة ونصائح عملية للآباء والأمهات.
+
+التوجيهات:
+- اربط أي إجابة بمنتج من منتجات الشركة، حتى لو السؤال عام.
+- إذا كان السؤال عن الشعر أو البشرة للأطفال، قدم نصائح عملية وأدرج منتج من الشركة كجزء من الحل.
+- لا تستخدم لغة سوقية أو تعبيرات غير لائقة.
+- اجعل الرد قصيرًا ومباشرًا، ويشجع العميل على اتخاذ خطوة شراء أو تجربة المنتج.
+
+🔹 مثال:
+المستخدم: ابني شعره بيقصف بعد البحر.
+الرد: للحفاظ على شعر طفلك بعد البحر، أنصحك باستخدام شامبو SmartKidz المغذي لأنه بيشيل آثار الملح وبيحافظ على ترطيب الشعر. ومعاه بلسم SmartKidz هتلاقي فرق ملحوظ في النعومة والحيوية.
+            `
           },
           {
             role: 'user',
             content: userMessage
           }
         ],
-        temperature: 0.4 // Lower temp for consistent tone
+        temperature: 0.3 // Consistent, professional tone
       },
       {
         headers: {
@@ -112,18 +122,37 @@ async function getGPTReply(userMessage) {
     return reply;
 
   } catch (err) {
-    console.error('Error from OpenAI:', err.message);
-    return "حصلت مشكلة أثناء محاولة الرد. ممكن تجرب تاني؟";
+    console.error('Error from OpenAI:', err.response?.data || err.message);
+    return "حدثت مشكلة أثناء محاولة الرد. من فضلك حاول مرة أخرى.";
   }
 }
 
 // === MATCH CUSTOM REPLIES DIRECTLY ===
 function getBestReply(userMessage) {
-  const lowerMsg = userMessage.toLowerCase();
-  const match = customReplies.find(r =>
-    lowerMsg.includes(r.trigger.toLowerCase())
-  );
-  return match ? { reply: match.reply } : null;
+  const lowerMsg = userMessage.toLowerCase().trim();
+
+  // Exact match first
+  let exactMatch = customReplies.find(r => lowerMsg === r.trigger.toLowerCase());
+  if (exactMatch) return { reply: exactMatch.reply };
+
+  // Partial match second
+  let partialMatch = customReplies.find(r => lowerMsg.includes(r.trigger.toLowerCase()));
+  return partialMatch ? { reply: partialMatch.reply } : null;
+}
+
+// === SEND TYPING INDICATOR ===
+async function sendTypingOn(recipientId) {
+  try {
+    await axios.post(
+      `https://graph.facebook.com/v17.0/me/messages?access_token=${PAGE_ACCESS_TOKEN}`,
+      {
+        recipient: { id: recipientId },
+        sender_action: "typing_on"
+      }
+    );
+  } catch (error) {
+    console.error('❌ Typing indicator error:', error.response?.data || error.message);
+  }
 }
 
 // === SEND MESSAGE TO FACEBOOK MESSENGER ===
@@ -157,4 +186,3 @@ const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
 });
-
