@@ -1,7 +1,5 @@
 const customReplies = require('./customReplies');
 
-// GPT-Messenger Bot - index.js
-
 const express = require('express');
 const bodyParser = require('body-parser');
 const axios = require('axios');
@@ -43,7 +41,6 @@ app.post('/webhook', async (req, res) => {
 
           const senderId = event.sender.id;
 
-          // Ignore non-text events like delivery receipts or read confirmations
           if (!event.message || !event.message.text || event.delivery || event.read) {
             continue;
           }
@@ -51,20 +48,28 @@ app.post('/webhook', async (req, res) => {
           const userMessage = event.message.text.trim();
           if (!userMessage) continue;
 
-          // 1. Try custom replies (exact match first, then partial)
+          // 1. Try custom replies
           const matchedReply = getBestReply(userMessage);
 
-          // 2. If no custom reply, use GPT
-          const finalReply = matchedReply?.reply || await getGPTReply(userMessage);
+          // Special handling for عروض
+          if (matchedReply && matchedReply.trigger.includes("عروض")) {
+            await sendTypingOn(senderId);
+            await sendMessage(senderId, "عندنا عروض مميزة تقدري تختاري منها اللي يناسب احتياجاتك 👌");
+            if (matchedReply.image) {
+              await sendImage(senderId, matchedReply.image);
+            }
+            await sendMessage(senderId, matchedReply.text);
+            continue;
+          }
 
-          console.log("✅ Final reply:", finalReply);
+          // 2. If no custom reply, use GPT
+          const finalReply = matchedReply?.text || await getGPTReply(userMessage);
 
           await sendTypingOn(senderId);
-          await new Promise(res => setTimeout(res, 1500)); // Simulate thinking
+          await new Promise(res => setTimeout(res, 1500));
           await sendMessage(senderId, finalReply);
         }
       }
-
       return res.sendStatus(200);
     } else {
       return res.sendStatus(404);
@@ -75,7 +80,7 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-// === GET GPT REPLY (Professional Egyptian Sales Style) ===
+// === GET GPT REPLY ===
 async function getGPTReply(userMessage) {
   try {
     const response = await axios.post(
@@ -90,16 +95,9 @@ async function getGPTReply(userMessage) {
 تتحدث باللهجة المصرية الرسمية والمحترمة، مع لمسة ود ودافئ، بدون أي عبارات عامية مبالغ فيها أو مصطلحات غير مألوفة.
 هدفك الأساسي هو بيع منتجات SmartKidz وإبراز فوائدها ومميزاتها كما هي محفوظة في ملف customReplies.js، 
 مع تقديم معلومات علمية موثوقة ونصائح عملية للآباء والأمهات.
-
-التوجيهات:
-- اربط أي إجابة بمنتج من منتجات الشركة، حتى لو السؤال عام.
+- اربط أي إجابة بمنتج من منتجات الشركة.
 - إذا كان السؤال عن الشعر أو البشرة للأطفال، قدم نصائح عملية وأدرج منتج من الشركة كجزء من الحل.
-- لا تستخدم لغة سوقية أو تعبيرات غير لائقة.
-- اجعل الرد قصيرًا ومباشرًا، ويشجع العميل على اتخاذ خطوة شراء أو تجربة المنتج.
-
-🔹 مثال:
-المستخدم: ابني شعره بيقصف بعد البحر.
-الرد: للحفاظ على شعر طفلك بعد البحر، أنصحك باستخدام شامبو SmartKidz المغذي لأنه بيشيل آثار الملح وبيحافظ على ترطيب الشعر. ومعاه بلسم SmartKidz هتلاقي فرق ملحوظ في النعومة والحيوية.
+- اجعل الرد قصيرًا ومباشرًا، ويشجع العميل على الشراء أو التجربة.
             `
           },
           {
@@ -107,7 +105,7 @@ async function getGPTReply(userMessage) {
             content: userMessage
           }
         ],
-        temperature: 0.3 // Consistent, professional tone
+        temperature: 0.3
       },
       {
         headers: {
@@ -117,30 +115,25 @@ async function getGPTReply(userMessage) {
       }
     );
 
-    const reply = response.data.choices[0].message.content.trim();
-    console.log("🤖 GPT reply:", reply);
-    return reply;
-
+    return response.data.choices[0].message.content.trim();
   } catch (err) {
     console.error('Error from OpenAI:', err.response?.data || err.message);
     return "حدثت مشكلة أثناء محاولة الرد. من فضلك حاول مرة أخرى.";
   }
 }
 
-// === MATCH CUSTOM REPLIES DIRECTLY ===
+// === MATCH CUSTOM REPLIES ===
 function getBestReply(userMessage) {
   const lowerMsg = userMessage.toLowerCase().trim();
 
-  // Exact match first
   let exactMatch = customReplies.find(r => lowerMsg === r.trigger.toLowerCase());
-  if (exactMatch) return { reply: exactMatch.reply };
+  if (exactMatch) return exactMatch;
 
-  // Partial match second
   let partialMatch = customReplies.find(r => lowerMsg.includes(r.trigger.toLowerCase()));
-  return partialMatch ? { reply: partialMatch.reply } : null;
+  return partialMatch || null;
 }
 
-// === SEND TYPING INDICATOR ===
+// === TYPING INDICATOR ===
 async function sendTypingOn(recipientId) {
   try {
     await axios.post(
@@ -155,13 +148,10 @@ async function sendTypingOn(recipientId) {
   }
 }
 
-// === SEND MESSAGE TO FACEBOOK MESSENGER ===
+// === SEND TEXT MESSAGE ===
 async function sendMessage(recipientId, message) {
   try {
-    if (!message || !message.trim()) {
-      console.log("⚠️ Empty message detected, skipping send.");
-      return;
-    }
+    if (!message || !message.trim()) return;
 
     await axios.post(
       `https://graph.facebook.com/v17.0/me/messages?access_token=${PAGE_ACCESS_TOKEN}`,
@@ -170,14 +160,32 @@ async function sendMessage(recipientId, message) {
         message: { text: message }
       }
     );
-
-    console.log(`✅ Message sent to ${recipientId}:`, message);
-
+    console.log(`✅ Text sent to ${recipientId}:`, message);
   } catch (error) {
-    console.error(
-      '❌ Messenger send error:',
-      error.response?.data || error.message
+    console.error('❌ Messenger send error:', error.response?.data || error.message);
+  }
+}
+
+// === SEND IMAGE MESSAGE ===
+async function sendImage(recipientId, imageUrl) {
+  try {
+    if (!imageUrl || !imageUrl.trim()) return;
+
+    await axios.post(
+      `https://graph.facebook.com/v17.0/me/messages?access_token=${PAGE_ACCESS_TOKEN}`,
+      {
+        recipient: { id: recipientId },
+        message: {
+          attachment: {
+            type: "image",
+            payload: { url: imageUrl, is_reusable: true }
+          }
+        }
+      }
     );
+    console.log(`✅ Image sent to ${recipientId}:`, imageUrl);
+  } catch (error) {
+    console.error('❌ Messenger send error (image):', error.response?.data || error.message);
   }
 }
 
