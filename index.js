@@ -80,6 +80,8 @@ async function getSmartReply(userMessage) {
 3. الوصف (description)
 4. إضافة نصيحة أو توضيح بسيط منك لتشجيع الشراء
 
+إذا كان سؤال العميل لا يتعلق بأي منتج، أجب بإجابة مفيدة وودية، وحاول أن تربط الموضوع بمنتج أو عرض من منتجات SmartKidz بطريقة ذكية.
+
 القائمة:
 ${JSON.stringify(productList, null, 2)}
 `;
@@ -92,7 +94,7 @@ ${JSON.stringify(productList, null, 2)}
           { role: 'system', content: systemPrompt },
           { role: 'user', content: userMessage }
         ],
-        temperature: 0.4
+        temperature: 0.5
       },
       {
         headers: {
