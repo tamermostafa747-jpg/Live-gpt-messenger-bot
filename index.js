@@ -1,5 +1,4 @@
 const customReplies = require('./customReplies');
-
 const express = require('express');
 const bodyParser = require('body-parser');
 const axios = require('axios');
@@ -37,37 +36,18 @@ app.post('/webhook', async (req, res) => {
     if (body.object === 'page') {
       for (const entry of body.entry) {
         for (const event of entry.messaging) {
-          console.log('📩 Incoming event:', event);
+          if (!event.message || !event.message.text) continue;
 
           const senderId = event.sender.id;
-
-          if (!event.message || !event.message.text || event.delivery || event.read) {
-            continue;
-          }
-
           const userMessage = event.message.text.trim();
           if (!userMessage) continue;
 
-          // 1. Try custom replies
-          const matchedReply = getBestReply(userMessage);
-
-          // Special handling for عروض
-          if (matchedReply && matchedReply.trigger.includes("عروض")) {
-            await sendTypingOn(senderId);
-            await sendMessage(senderId, "عندنا عروض مميزة تقدري تختاري منها اللي يناسب احتياجاتك 👌");
-            if (matchedReply.image) {
-              await sendImage(senderId, matchedReply.image);
-            }
-            await sendMessage(senderId, matchedReply.text);
-            continue;
-          }
-
-          // 2. If no custom reply, use GPT
-          const finalReply = matchedReply?.text || await getGPTReply(userMessage);
+          // Get smart reply
+          const finalReply = await getSmartReply(userMessage);
 
           await sendTypingOn(senderId);
-          await new Promise(res => setTimeout(res, 1500));
-          await sendMessage(senderId, finalReply);
+          await new Promise(resolve => setTimeout(resolve, 1200));
+          await sendReply(senderId, finalReply);
         }
       }
       return res.sendStatus(200);
@@ -80,32 +60,39 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-// === GET GPT REPLY ===
-async function getGPTReply(userMessage) {
+// === SMART REPLY FUNCTION ===
+async function getSmartReply(userMessage) {
   try {
+    const productList = customReplies.map((r, i) => ({
+      id: i + 1,
+      trigger: r.trigger,
+      intro: r.reply.intro,
+      image: r.reply.image,
+      description: r.reply.description
+    }));
+
+    const systemPrompt = `
+أنت أخصائي مبيعات وخبير استشارات في شركة SmartKidz المتخصصة في منتجات العناية بالشعر والبشرة للأطفال.
+تتحدث باللهجة المصرية المحترمة والمهنية، وهدفك الرئيسي هو مساعدة العميل في اختيار المنتج المناسب من القائمة المرفقة.
+إذا كان سؤال العميل مرتبطًا بأي منتج أو عرض من القائمة، اختر المنتج الأنسب وأرسل:
+1. جملة الترحيب/المقدمة (intro)
+2. رابط الصورة (image)
+3. الوصف (description)
+4. إضافة نصيحة أو توضيح بسيط منك لتشجيع الشراء
+
+القائمة:
+${JSON.stringify(productList, null, 2)}
+`;
+
     const response = await axios.post(
       OPENAI_API_URL,
       {
         model: 'gpt-4o-mini',
         messages: [
-          {
-            role: 'system',
-            content: `
-أنت أخصائي مبيعات وخبير استشارات في شركة SmartKidz المتخصصة في منتجات العناية بالشعر والبشرة للأطفال. 
-تتحدث باللهجة المصرية الرسمية والمحترمة، مع لمسة ود ودافئ، بدون أي عبارات عامية مبالغ فيها أو مصطلحات غير مألوفة.
-هدفك الأساسي هو بيع منتجات SmartKidz وإبراز فوائدها ومميزاتها كما هي محفوظة في ملف customReplies.js، 
-مع تقديم معلومات علمية موثوقة ونصائح عملية للآباء والأمهات.
-- اربط أي إجابة بمنتج من منتجات الشركة.
-- إذا كان السؤال عن الشعر أو البشرة للأطفال، قدم نصائح عملية وأدرج منتج من الشركة كجزء من الحل.
-- اجعل الرد قصيرًا ومباشرًا، ويشجع العميل على الشراء أو التجربة.
-            `
-          },
-          {
-            role: 'user',
-            content: userMessage
-          }
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userMessage }
         ],
-        temperature: 0.3
+        temperature: 0.4
       },
       {
         headers: {
@@ -118,79 +105,51 @@ async function getGPTReply(userMessage) {
     return response.data.choices[0].message.content.trim();
   } catch (err) {
     console.error('Error from OpenAI:', err.response?.data || err.message);
-    return "حدثت مشكلة أثناء محاولة الرد. من فضلك حاول مرة أخرى.";
+    return "عذرًا، حصلت مشكلة مؤقتة. ممكن تحاول تاني؟";
   }
 }
 
-// === MATCH CUSTOM REPLIES ===
-function getBestReply(userMessage) {
-  const lowerMsg = userMessage.toLowerCase().trim();
-
-  let exactMatch = customReplies.find(r => lowerMsg === r.trigger.toLowerCase());
-  if (exactMatch) return exactMatch;
-
-  let partialMatch = customReplies.find(r => lowerMsg.includes(r.trigger.toLowerCase()));
-  return partialMatch || null;
-}
-
-// === TYPING INDICATOR ===
+// === SEND TYPING INDICATOR ===
 async function sendTypingOn(recipientId) {
   try {
     await axios.post(
       `https://graph.facebook.com/v17.0/me/messages?access_token=${PAGE_ACCESS_TOKEN}`,
-      {
-        recipient: { id: recipientId },
-        sender_action: "typing_on"
-      }
+      { recipient: { id: recipientId }, sender_action: 'typing_on' }
     );
   } catch (error) {
-    console.error('❌ Typing indicator error:', error.response?.data || error.message);
+    console.error('Typing indicator error:', error.message);
   }
 }
 
-// === SEND TEXT MESSAGE ===
-async function sendMessage(recipientId, message) {
+// === SEND REPLY (Supports image + text) ===
+async function sendReply(recipientId, replyContent) {
   try {
-    if (!message || !message.trim()) return;
-
-    await axios.post(
-      `https://graph.facebook.com/v17.0/me/messages?access_token=${PAGE_ACCESS_TOKEN}`,
-      {
-        recipient: { id: recipientId },
-        message: { text: message }
-      }
-    );
-    console.log(`✅ Text sent to ${recipientId}:`, message);
-  } catch (error) {
-    console.error('❌ Messenger send error:', error.response?.data || error.message);
-  }
-}
-
-// === SEND IMAGE MESSAGE ===
-async function sendImage(recipientId, imageUrl) {
-  try {
-    if (!imageUrl || !imageUrl.trim()) return;
-
-    await axios.post(
-      `https://graph.facebook.com/v17.0/me/messages?access_token=${PAGE_ACCESS_TOKEN}`,
-      {
-        recipient: { id: recipientId },
-        message: {
-          attachment: {
-            type: "image",
-            payload: { url: imageUrl, is_reusable: true }
+    const parts = replyContent.split("\n").filter(p => p.trim());
+    for (let part of parts) {
+      if (part.startsWith("http")) {
+        // Send image
+        await axios.post(
+          `https://graph.facebook.com/v17.0/me/messages?access_token=${PAGE_ACCESS_TOKEN}`,
+          {
+            recipient: { id: recipientId },
+            message: {
+              attachment: { type: 'image', payload: { url: part, is_reusable: true } }
+            }
           }
-        }
+        );
+      } else {
+        // Send text
+        await axios.post(
+          `https://graph.facebook.com/v17.0/me/messages?access_token=${PAGE_ACCESS_TOKEN}`,
+          { recipient: { id: recipientId }, message: { text: part } }
+        );
       }
-    );
-    console.log(`✅ Image sent to ${recipientId}:`, imageUrl);
+    }
   } catch (error) {
-    console.error('❌ Messenger send error (image):', error.response?.data || error.message);
+    console.error('Messenger send error:', error.message);
   }
 }
 
 // === START SERVER ===
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
