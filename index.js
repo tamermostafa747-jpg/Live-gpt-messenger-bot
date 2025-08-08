@@ -15,7 +15,8 @@ const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 const PAGE_ACCESS_TOKEN = process.env.PAGE_ACCESS_TOKEN;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const OPENAI_API_URL = 'https://api.openai.com/v1/chat/completions';
-const GPT_MODEL = process.env.GPT_MODEL || 'gpt-4o'; // switch to 'gpt-5' when available
+// Default to gpt-5-mini; override with env if you like
+const GPT_MODEL = process.env.GPT_MODEL || 'gpt-5-mini';
 
 // === HEALTH CHECK ===
 app.get('/', (_req, res) => res.status(200).send('SmartKidz bot up ✅'));
@@ -34,7 +35,7 @@ app.get('/webhook', (req, res) => {
   return res.sendStatus(403);
 });
 
-// --- Arabic normalization (remove diacritics, unify letters) ---
+// --- Arabic normalization ---
 function normalizeAr(str = '') {
   return String(str)
     .toLowerCase()
@@ -75,15 +76,28 @@ app.post('/webhook', async (req, res) => {
 
     for (const entry of req.body.entry) {
       for (const event of entry.messaging) {
-        const text = event?.message?.text;
-        if (!text) continue;
+        // Ignore echoes & delivery events
+        if (event.message && event.message.is_echo) continue;
 
-        const senderId = event.sender.id;
-        const userMessage = text.trim();
-        if (!userMessage) continue;
+        const senderId = event.sender?.id;
+        const text = event.message?.text;
+        const attachments = event.message?.attachments || [];
+        const postback = event.postback?.payload;
+
+        let userMessage = (text || postback || '').toString().trim();
+
+        // Basic handling for attachments (photos/voice) → nudge user
+        if (!userMessage && attachments.length) {
+          await sendReply(
+            senderId,
+            'استقبلت مرفق 😊 لو تحبّي أقدر أساعدك أكتر لما تبعتي سؤالك نصًا عن شعر الطفل أو المنتجات.'
+          );
+          continue;
+        }
+
+        if (!senderId || !userMessage) continue;
 
         const finalReply = await getSmartReply(userMessage);
-
         await sendTypingOn(senderId);
         await delay(900);
         await sendReply(senderId, finalReply);
@@ -146,7 +160,7 @@ ${JSON.stringify(
       userPrompt = userMessage;
     }
 
-    const gpt = await axios.post(
+    const { data } = await axios.post(
       OPENAI_API_URL,
       {
         model: GPT_MODEL,
@@ -154,20 +168,21 @@ ${JSON.stringify(
           { role: 'system', content: systemPrompt },
           { role: 'user', content: userPrompt }
         ],
-        temperature: 0.65
+        temperature: 0.65,
+        max_tokens: 450 // keep Messenger-friendly
       },
       {
         headers: {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${OPENAI_API_KEY}`
-        }
+        },
+        timeout: 15000 // 15s safety
       }
     );
 
-    // Build a unified reply payload we can send (text + images)
-    const textFromGpt = (gpt.data.choices?.[0]?.message?.content || '').trim();
+    const textFromGpt = (data.choices?.[0]?.message?.content || '').trim();
 
-    // If we matched a custom intent, include its media (image + gallery) after the text
+    // If we matched a custom intent, include its media (image + gallery)
     let images = [];
     if (confident) {
       const r = top.item.reply || {};
@@ -191,6 +206,7 @@ function formatReply(text = '', imageUrls = []) {
 
 // === SEND TYPING ===
 async function sendTypingOn(recipientId) {
+  if (!recipientId) return;
   try {
     await axios.post(
       `https://graph.facebook.com/v17.0/me/messages?access_token=${PAGE_ACCESS_TOKEN}`,
@@ -203,6 +219,7 @@ async function sendTypingOn(recipientId) {
 
 // === SEND MESSAGE (supports images & multi-line) ===
 async function sendReply(recipientId, replyContent) {
+  if (!recipientId) return;
   try {
     const parts = String(replyContent).split('\n').filter(p => p.trim());
     for (const part of parts) {
@@ -218,12 +235,12 @@ async function sendReply(recipientId, replyContent) {
           }
         );
       } else {
-        // Messenger hard limit is ~2000 chars; chunk just in case
         for (const chunk of chunkText(part, 1800)) {
           await axios.post(
             `https://graph.facebook.com/v17.0/me/messages?access_token=${PAGE_ACCESS_TOKEN}`,
             { recipient: { id: recipientId }, message: { text: chunk } }
           );
+          await delay(200);
         }
       }
       await delay(250);
@@ -239,14 +256,10 @@ function chunkText(str, max = 1800) {
   const s = String(str);
   if (s.length <= max) return [s];
   const out = [];
-  let i = 0;
-  while (i < s.length) {
-    out.push(s.slice(i, i + max));
-    i += max;
-  }
+  for (let i = 0; i < s.length; i += max) out.push(s.slice(i, i + max));
   return out;
 }
 
 // === START ===
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT} (model: ${GPT_MODEL})`));
