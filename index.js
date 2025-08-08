@@ -1,7 +1,7 @@
-const customReplies = require('./customReplies');
 const express = require('express');
 const bodyParser = require('body-parser');
 const axios = require('axios');
+const customReplies = require('./customReplies');
 require('dotenv').config();
 
 const app = express();
@@ -13,6 +13,7 @@ const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 const PAGE_ACCESS_TOKEN = process.env.PAGE_ACCESS_TOKEN;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const OPENAI_API_URL = 'https://api.openai.com/v1/chat/completions';
+const GPT_MODEL = 'gpt-4o'; // Or 'gpt-5' when available to your account
 
 // === VERIFY WEBHOOK ===
 app.get('/webhook', (req, res) => {
@@ -21,7 +22,7 @@ app.get('/webhook', (req, res) => {
   const challenge = req.query['hub.challenge'];
 
   if (mode && token && mode === 'subscribe' && token === VERIFY_TOKEN) {
-    console.log('Webhook verified');
+    console.log('✅ Webhook verified');
     res.status(200).send(challenge);
   } else {
     res.sendStatus(403);
@@ -31,31 +32,30 @@ app.get('/webhook', (req, res) => {
 // === HANDLE INCOMING MESSAGES ===
 app.post('/webhook', async (req, res) => {
   try {
-    const body = req.body;
-
-    if (body.object === 'page') {
-      for (const entry of body.entry) {
+    if (req.body.object === 'page') {
+      for (const entry of req.body.entry) {
         for (const event of entry.messaging) {
-          if (!event.message || !event.message.text) continue;
+          if (event.message && event.message.text) {
+            const senderId = event.sender.id;
+            const userMessage = event.message.text.trim();
 
-          const senderId = event.sender.id;
-          const userMessage = event.message.text.trim();
-          if (!userMessage) continue;
+            if (!userMessage) continue;
 
-          // Get smart reply
-          const finalReply = await getSmartReply(userMessage);
+            // Determine reply
+            const finalReply = await getSmartReply(userMessage);
 
-          await sendTypingOn(senderId);
-          await new Promise(resolve => setTimeout(resolve, 1200));
-          await sendReply(senderId, finalReply);
+            await sendTypingOn(senderId);
+            await new Promise(resolve => setTimeout(resolve, 1000));
+            await sendReply(senderId, finalReply);
+          }
         }
       }
-      return res.sendStatus(200);
+      res.sendStatus(200);
     } else {
-      return res.sendStatus(404);
+      res.sendStatus(404);
     }
   } catch (err) {
-    console.error('Webhook error:', err.message);
+    console.error('❌ Webhook error:', err.message);
     res.sendStatus(500);
   }
 });
@@ -63,38 +63,39 @@ app.post('/webhook', async (req, res) => {
 // === SMART REPLY FUNCTION ===
 async function getSmartReply(userMessage) {
   try {
-    const productList = customReplies.map((r, i) => ({
-      id: i + 1,
-      trigger: r.trigger,
-      intro: r.reply.intro,
-      image: r.reply.image,
-      description: r.reply.description
-    }));
+    // Check if matches custom trigger
+    const matched = customReplies.find(r =>
+      userMessage.toLowerCase().includes(r.trigger.toLowerCase())
+    );
 
-    const systemPrompt = `
-أنت أخصائي مبيعات وخبير استشارات في شركة SmartKidz المتخصصة في منتجات العناية بالشعر والبشرة للأطفال.
-تتحدث باللهجة المصرية المحترمة والمهنية، وهدفك الرئيسي هو مساعدة العميل في اختيار المنتج المناسب من القائمة المرفقة.
-إذا كان سؤال العميل مرتبطًا بأي منتج أو عرض من القائمة، اختر المنتج الأنسب وأرسل:
-1. جملة الترحيب/المقدمة (intro)
-2. رابط الصورة (image)
-3. الوصف (description)
-4. إضافة نصيحة أو توضيح بسيط منك لتشجيع الشراء
-
-إذا كان سؤال العميل لا يتعلق بأي منتج، أجب بإجابة مفيدة وودية، وحاول أن تربط الموضوع بمنتج أو عرض من منتجات SmartKidz بطريقة ذكية.
-
-القائمة:
-${JSON.stringify(productList, null, 2)}
-`;
+    let contextMessage;
+    if (matched) {
+      // Let GPT rewrite the custom reply to sound natural & warm
+      contextMessage = `
+أنت خبير عناية بشعر وبشرة الأطفال في شركة SmartKidz.
+تحدث بلغة مهنية ودافئة، وكأنك طبيب متخصص، مع هدف تسويق الفوائد الصحية لمنتجاتنا.
+هذه هي المعلومات التي يجب أن تعتمد عليها في الرد:
+${matched.reply}
+اجعل الرد شخصي ويشجع العميل على الشراء.
+      `;
+    } else {
+      // Generic fallback - let GPT handle
+      contextMessage = `
+أنت خبير عناية بشعر وبشرة الأطفال في شركة SmartKidz.
+جاوب على السؤال التالي بإجابات ودودة ومفيدة.
+اربط الإجابة بمنتجات SmartKidz بطريقة ذكية حتى لو السؤال عام.
+      `;
+    }
 
     const response = await axios.post(
       OPENAI_API_URL,
       {
-        model: 'gpt-4o-mini',
+        model: GPT_MODEL,
         messages: [
-          { role: 'system', content: systemPrompt },
+          { role: 'system', content: contextMessage },
           { role: 'user', content: userMessage }
         ],
-        temperature: 0.5
+        temperature: 0.7
       },
       {
         headers: {
@@ -106,7 +107,7 @@ ${JSON.stringify(productList, null, 2)}
 
     return response.data.choices[0].message.content.trim();
   } catch (err) {
-    console.error('Error from OpenAI:', err.response?.data || err.message);
+    console.error('❌ Error from OpenAI:', err.response?.data || err.message);
     return "عذرًا، حصلت مشكلة مؤقتة. ممكن تحاول تاني؟";
   }
 }
@@ -119,14 +120,15 @@ async function sendTypingOn(recipientId) {
       { recipient: { id: recipientId }, sender_action: 'typing_on' }
     );
   } catch (error) {
-    console.error('Typing indicator error:', error.message);
+    console.error('❌ Typing indicator error:', error.message);
   }
 }
 
-// === SEND REPLY (Supports image + text) ===
+// === SEND REPLY ===
 async function sendReply(recipientId, replyContent) {
   try {
     const parts = replyContent.split("\n").filter(p => p.trim());
+
     for (let part of parts) {
       if (part.startsWith("http")) {
         // Send image
@@ -148,7 +150,7 @@ async function sendReply(recipientId, replyContent) {
       }
     }
   } catch (error) {
-    console.error('Messenger send error:', error.message);
+    console.error('❌ Messenger send error:', error.message);
   }
 }
 
