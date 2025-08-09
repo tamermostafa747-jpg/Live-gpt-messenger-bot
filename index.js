@@ -17,6 +17,18 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const OPENAI_API_URL = 'https://api.openai.com/v1/chat/completions';
 const GPT_MODEL = process.env.GPT_MODEL || 'gpt-5-mini';
 
+// === SIMPLE IN-MEMORY CONVERSATION STATE (last 6 turns per user) ===
+const MEMORY = new Map();
+const MAX_TURNS = 6;               // user+assistant turns to keep
+const CLEANUP_MS = 1000 * 60 * 60; // 1h cleanup
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, s] of MEMORY.entries()) {
+    if (now - (s.updatedAt || now) > CLEANUP_MS) MEMORY.delete(id);
+  }
+}, CLEANUP_MS);
+
 // === HEALTH CHECK ===
 app.get('/', (_req, res) => res.status(200).send('SmartKidz bot up ✅'));
 app.get('/health', (_req, res) => res.status(200).json({ ok: true }));
@@ -48,24 +60,24 @@ function normalizeAr(str = '') {
 
 // === Simple detectors ===
 const GREETINGS = [
-  'hi','hello','hey','الو','هاي','هلا','مرحبا','صباح الخير','مساء الخير','ازيك','عامل ايه','عامله ايه'
+  'hi','hello','hey','الو','هاي','هلا','مرحبا',
+  'صباح الخير','مساء الخير','ازيك','عامل ايه','عامله ايه','اهلا'
 ].map(normalizeAr);
 
 const HAIR_SKIN_HINTS = [
   'شعر','فروه','هيشان','جفاف','تقصف','قشره','تساقط',
   'بلسم','شامبو','ليف','زيت','ترطيب','تنظيف','تشابك',
-  'طفل','اطفال','بشره','حساسه','حبوب','حكه'
+  'طفل','اطفال','بشره','حساسه','حبوب','حكه','تهيج','قشرة'
 ].map(normalizeAr);
 
 function isSmallTalk(s) {
   const n = normalizeAr(s);
   if (!n) return false;
-  return (n.length <= 20 && GREETINGS.some(g => n.includes(g)));
+  return (n.length <= 24 && GREETINGS.some(g => n.includes(g)));
 }
 function isHairSkinQuery(s) {
   const n = normalizeAr(s);
-  let hits = 0;
-  HAIR_SKIN_HINTS.forEach(h => { if (n.includes(h)) hits++; });
+  let hits = 0; HAIR_SKIN_HINTS.forEach(h => { if (n.includes(h)) hits++; });
   return hits >= 1;
 }
 
@@ -76,18 +88,19 @@ const fusedData = customReplies.map(it => ({
   _normKeywords: (it.keywords || []).map(normalizeAr),
   _normExamples: (it.examples || []).map(normalizeAr)
 }));
+
 const fuse = new Fuse(fusedData, {
   includeScore: true,
-  threshold: 0.34,
+  threshold: 0.32, // a bit stricter to avoid random matches
   keys: ['_normTrigger','_normKeywords','_normExamples','reply.title','reply.description']
 });
 
 // === HANDLE INCOMING MESSAGES ===
-// IMPORTANT: acknowledge immediately, then process async (prevents Messenger timeouts)
+// ack immediately to avoid Messenger timeouts; process async
 app.post('/webhook', (req, res) => {
   try {
     if (req.body.object !== 'page') return res.sendStatus(404);
-    res.sendStatus(200); // <-- immediate ack
+    res.sendStatus(200);
 
     for (const entry of req.body.entry || []) {
       for (const event of entry.messaging || []) {
@@ -98,7 +111,6 @@ app.post('/webhook', (req, res) => {
     }
   } catch (e) {
     console.error('❌ Webhook crash:', e);
-    // we already replied 200; nothing else to do
   }
 });
 
@@ -119,47 +131,62 @@ async function handleMessagingEvent(event) {
   if (!userMessage) return;
 
   await sendTypingOn(senderId);
-  const reply = await routeAndReply(userMessage);
-  await delay(600);
+  const reply = await routeAndReply(senderId, userMessage);
+  await delay(550);
   await sendReply(senderId, reply);
 }
 
 // === Router: decide how to answer ===
-async function routeAndReply(userMessage) {
+async function routeAndReply(senderId, userMessage) {
   try {
+    // keep convo memory
+    const state = MEMORY.get(senderId) || { history: [], updatedAt: Date.now() };
+    state.history.push({ role: 'user', content: userMessage });
+    state.history = state.history.slice(-MAX_TURNS);
+    state.updatedAt = Date.now();
+    MEMORY.set(senderId, state);
+
+    // 1) greeting → keep it short, ask a single follow-up
     if (isSmallTalk(userMessage)) {
       const text = await callGPT({
+        senderId,
         persona: basePersona({ mode: 'smalltalk' }),
-        user: `تحية/سؤال قصير من المستخدم: "${userMessage}".
-أجب بتحية قصيرة دافئة وبسؤال واحد بسيط: تحبّي اساعدك في ايه بخصوص شعر او بشرة طفلك؟`,
+        user: `تحية قصيرة: "${userMessage}". 
+أجب بتحية ودودة جدًا + سؤال متابعة واحد فقط: تحبّي اساعدك في ايه بخصوص شعر أو بشرة طفلك؟`,
         tokens: 120
       });
       return text || 'أهلا بيكي! تحبي أساعدك في ايه بخصوص شعر أو بشرة طفلك؟';
     }
 
+    // 2) hair/skin → expert answer; include *relevant* product snippets if any
     if (isHairSkinQuery(userMessage)) {
       const hits = fuse.search(normalizeAr(userMessage)).slice(0, 2).map(r => r.item.reply);
       const context = JSON.stringify(hits, null, 2);
       const text = await callGPT({
+        senderId,
         persona: basePersona({ mode: 'expert' }),
         user:
 `سؤال العميل عن العناية بالشعر/البشرة: """${userMessage}"""
-معلومات منتجات قد تكون مفيدة (استخدمها كمرجع فقط ولا تنقلها حرفيًا):
+معلومات منتجات للاستئناس (لا تنقلها حرفيًا):
 ${context}
 
-اكتب ردًا طبيًا بسيطًا ولطيفًا: 1) افهم الحالة باختصار، 2) قدّم نصيحة عملية خطوة بخطوة تناسب الأطفال،
-3) إن كانت هناك ملائمة واضحة جدًا، اقترح منتجًا واحدًا من البيانات مع سبب مختصر،
-4) اسأل سؤال متابعة واحد لتخصيص النصيحة (سن الطفل/نوع الشعر/شدة المشكلة).`,
+اكتب ردًا بسيطًا ودقيقًا: 
+1) افهم المشكلة بإيجاز، 2) قدّم خطوات عملية مناسبة للأطفال، 
+3) لو فيه ملائمة واضحة جدًا اقترح منتجًا واحدًا فقط ولماذا،
+4) اختتم بسؤال متابعة واحد لتخصيص النصيحة (سن الطفل/نوع الشعر/شدة المشكلة).`,
         tokens: 380
       });
       return text || 'تمام — ممكن تحكيلي سن الطفل ونوع الشعر والمشكلة الأساسية (هيشان/جفاف/تقصف/قشرة) علشان أوصّف روتين مناسب؟';
     }
 
+    // 3) anything else → normal assistant; *very* light product nudge only if logical
     const text = await callGPT({
+      senderId,
       persona: basePersona({ mode: 'general' }),
       user:
-`سؤال عام من العميل: """${userMessage}"""
-أجب بإيجاز وبشكل مفيد. لو ينفع تربط بنصيحة عناية بالأطفال أو بنقطة منطقية من منتجات SmartKidz فلتكن إشارة خفيفة جدًا فقط.`,
+`سؤال عام: """${userMessage}"""
+جاوب بإيجاز ومساعدة عملية. 
+لو منطقي جدًا فقط، اشِر لجانب من منتجات SmartKidz بجملة واحدة بدون بيع مباشر.`,
       tokens: 280
     });
     return text || 'حاضر! احكيلي أكتر تحبي نساعدك في ايه؟';
@@ -173,9 +200,9 @@ ${context}
 function basePersona({ mode }) {
   const core = `
 أنت طبيب أطفال وخبير عناية بشعر وبشرة الأطفال لدى SmartKidz.
-تتكلم بلغة مصرية مهذبة ودافئة. دقيقة وبدون وعود علاجية قطعية.
-تذكير مهم: الاستجابة قد تختلف من طفل لآخر؛ لا تعطي تشخيص طبي.`;
-  const small = `الهدف: تحية قصيرة وودية + سؤال متابعة واحد لمعرفة الحاجة. لا تعرض منتجات.`;
+تتكلم بلغة مصرية مهذبة ودافئة، وبدون وعود علاجية قطعية.
+تذكير: الاستجابة قد تختلف من طفل لآخر؛ لا تقدّم تشخيصًا طبيًا.`;
+  const small = `الهدف: تحية قصيرة جدًا + سؤال متابعة واحد لمعرفة الحاجة. لا تعرض منتجات.`;
   const expert = `الهدف: فهم المشكلة وتقديم خطوات عملية آمنة، ثم اقتراح منتج واحد فقط إذا كان مناسبًا بوضوح.`;
   const general = `الهدف: إجابة عامة مفيدة. لا تعرض منتجات إلا لو منطقي جدًا وبجملة واحدة.`;
   if (mode === 'smalltalk') return `${core}\n${small}`;
@@ -184,24 +211,34 @@ function basePersona({ mode }) {
 }
 
 // === GPT caller (handles gpt-5 vs others) ===
-async function callGPT({ persona, user, tokens = 300 }) {
+async function callGPT({ senderId, persona, user, tokens = 300 }) {
+  // assemble short memory
+  const history = (MEMORY.get(senderId)?.history || []).slice(-MAX_TURNS);
   const isGpt5 = /^gpt-5/i.test(GPT_MODEL);
-  const payload = {
-    model: GPT_MODEL,
-    messages: [
-      { role: 'system', content: persona },
-      { role: 'user', content: user }
-    ]
-  };
+
+  const messages = [{ role: 'system', content: persona }];
+  for (const turn of history) messages.push(turn);
+  messages.push({ role: 'user', content: user });
+
+  const payload = { model: GPT_MODEL, messages };
   if (isGpt5) payload.max_completion_tokens = Math.min(tokens, 500);
-  else { payload.temperature = 0.65; payload.max_tokens = Math.min(tokens, 500); }
+  else { payload.temperature = 0.6; payload.max_tokens = Math.min(tokens, 500); }
 
   try {
     const { data } = await axios.post(OPENAI_API_URL, payload, {
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${OPENAI_API_KEY}` },
       timeout: 15000
     });
-    return (data.choices?.[0]?.message?.content || '').trim();
+
+    const answer = (data.choices?.[0]?.message?.content || '').trim();
+    // save assistant answer to memory
+    const state = MEMORY.get(senderId) || { history: [], updatedAt: Date.now() };
+    state.history.push({ role: 'assistant', content: answer });
+    state.history = state.history.slice(-MAX_TURNS);
+    state.updatedAt = Date.now();
+    MEMORY.set(senderId, state);
+
+    return answer;
   } catch (e) {
     console.error('❌ OpenAI error:', e?.response?.data || e.message);
     return '';
@@ -241,10 +278,10 @@ async function sendReply(recipientId, replyContent) {
             `https://graph.facebook.com/v17.0/me/messages?access_token=${PAGE_ACCESS_TOKEN}`,
             { recipient: { id: recipientId }, message: { text: chunk } }
           );
-          await delay(160);
+          await delay(150);
         }
       }
-      await delay(200);
+      await delay(180);
     }
   } catch (e) {
     console.error('Send error:', e?.response?.data || e.message);
