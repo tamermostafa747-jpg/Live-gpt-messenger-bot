@@ -160,25 +160,29 @@ ${JSON.stringify(
       userPrompt = userMessage;
     }
 
-    const { data } = await axios.post(
-      OPENAI_API_URL,
-      {
-        model: GPT_MODEL,
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: userPrompt }
-        ],
-        temperature: 0.65,
-        max_tokens: 450 // keep Messenger-friendly
+    // Build payload with correct token limit field
+    const isGpt5 = /^gpt-5/i.test(GPT_MODEL);
+    const payload = {
+      model: GPT_MODEL,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt }
+      ],
+      temperature: 0.65
+    };
+    if (isGpt5) {
+      payload.max_completion_tokens = 450; // GPT-5 expects this field
+    } else {
+      payload.max_tokens = 450; // older models (e.g., gpt-4o)
+    }
+
+    const { data } = await axios.post(OPENAI_API_URL, payload, {
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${OPENAI_API_KEY}`
       },
-      {
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${OPENAI_API_KEY}`
-        },
-        timeout: 15000 // 15s safety
-      }
-    );
+      timeout: 15000
+    });
 
     const textFromGpt = (data.choices?.[0]?.message?.content || '').trim();
 
