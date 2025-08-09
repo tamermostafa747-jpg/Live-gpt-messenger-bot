@@ -116,8 +116,7 @@ async function getSmartReply(userMessage) {
 نوّه أن الاستجابة قد تختلف من طفل لآخر.
 `;
 
-    let systemPrompt;
-    let userPrompt;
+    let systemPrompt, userPrompt;
 
     if (confident) {
       const intent = top.item;
@@ -162,7 +161,7 @@ ${JSON.stringify(
     };
 
     if (isGpt5) {
-      // GPT-5 family: no custom temperature (defaults to 1), and uses max_completion_tokens
+      // GPT-5 family: no custom temperature; use max_completion_tokens
       payload.max_completion_tokens = 450;
     } else {
       // Older models: support temperature + max_tokens
@@ -178,7 +177,12 @@ ${JSON.stringify(
       timeout: 15000
     });
 
-    const textFromGpt = (data.choices?.[0]?.message?.content || '').trim();
+    // Ensure we always have something to send
+    let textFromGpt = (data.choices?.[0]?.message?.content || '').trim();
+    if (!textFromGpt) {
+      textFromGpt =
+        'مفهوم 👌 احكيلي سن الطفل ونوع الشعر والمشكلة الأساسية (هيشان/جفاف/تشابك). كبداية، شامبو SmartKidz اللطيف مع كريم ليف إن بيساعدوا على تنظيف لطيف وفك التشابك وتغذية الشعر.';
+    }
 
     // If we matched a custom intent, include its media (image + gallery)
     let images = [];
@@ -188,7 +192,9 @@ ${JSON.stringify(
       if (Array.isArray(r.gallery)) images = images.concat(r.gallery.filter(Boolean));
     }
 
-    return formatReply(textFromGpt, images);
+    const out = formatReply(textFromGpt, images);
+    console.log('Final reply preview:', out.slice(0, 300));
+    return out;
   } catch (e) {
     console.error('❌ OpenAI error:', e?.response?.data || e.message);
     return formatReply('عذرًا، حصلت مشكلة مؤقتة—ممكن نجرب تاني؟');
@@ -219,17 +225,23 @@ async function sendTypingOn(recipientId) {
 async function sendReply(recipientId, replyContent) {
   if (!recipientId) return;
   try {
-    const parts = String(replyContent).split('\n').filter(p => p.trim());
+    let parts = String(replyContent).split('\n').map(p => p.trim()).filter(Boolean);
+
+    // Hard fallback if empty for any reason
+    if (!parts.length) {
+      parts = [
+        'تمام 🙌 ابعتيلي سن الطفل، نوع الشعر (ناعم/مموج/كيرلي)، والمشكلة الأساسية (هيشان/جفاف/تشابك)، وأنا أختارلك الروتين المناسب من SmartKidz.'
+      ];
+    }
+
     for (const part of parts) {
-      const isUrl = /^https?:\/\/\S+$/i.test(part.trim());
+      const isUrl = /^https?:\/\/\S+$/i.test(part);
       if (isUrl) {
         await axios.post(
           `https://graph.facebook.com/v17.0/me/messages?access_token=${PAGE_ACCESS_TOKEN}`,
           {
             recipient: { id: recipientId },
-            message: {
-              attachment: { type: 'image', payload: { url: part.trim(), is_reusable: true } }
-            }
+            message: { attachment: { type: 'image', payload: { url: part, is_reusable: true } } }
           }
         );
       } else {
