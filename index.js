@@ -26,7 +26,6 @@ app.get('/webhook', (req, res) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
   const challenge = req.query['hub.challenge'];
-
   if (mode && token && mode === 'subscribe' && token === VERIFY_TOKEN) {
     console.log('✅ Webhook verified');
     return res.status(200).send(challenge);
@@ -47,63 +46,45 @@ function normalizeAr(str = '') {
     .trim();
 }
 
-// === Small talk detection (fast, no GPT) ===
-const SMALL_TALK_PATTERNS = [
-  { key: 'greet',  re: /^(?:hi|hello|hey|السلام|مرحبا|اهلا|هاي)\b/i, ar: /^(?:اهلا|مرحبا|سلام|مساء الخير|صباح الخير)/ },
-  { key: 'how',    re: /(how are you|how r u|how’s it going)/i, ar: /(اخبارك|عامل ايه|عامل ايه|ازيك|عامله ايه)/ },
-  { key: 'thanks', re: /\b(thanks|thank you|thx)\b/i, ar: /(شكرا|متشكر)/ },
-  { key: 'bye',    re: /\b(bye|goodbye|see you|later)\b/i, ar: /(مع السلامه|باي|سلام)/ },
-];
+// === Simple detectors ===
+const GREETINGS = [
+  'hi', 'hello', 'hey', 'الو', 'هاي', 'هلا', 'مرحبا',
+  'صباح الخير', 'مساء الخير', 'ازيك', 'عامل ايه', 'عامله ايه'
+].map(normalizeAr);
 
-function matchSmallTalk(msg) {
-  const m = msg.trim();
-  const n = normalizeAr(m);
-  // English
-  for (const p of SMALL_TALK_PATTERNS) {
-    if (p.re && p.re.test(m)) return p.key;
-    if (p.ar && p.ar.test(n)) return p.key;
-  }
-  return null;
+const HAIR_SKIN_HINTS = [
+  'شعر','فروه','هيشان','جفاف','تقصف','قشره','تساقط',
+  'بلسم','شامبو','ليف','زيت','ترطيب','تنظيف','تشابك',
+  'طفل','اطفال','بشره','حساسه','حبوب','حكه'
+].map(normalizeAr);
+
+function isSmallTalk(s) {
+  const n = normalizeAr(s);
+  if (!n) return false;
+  // short messages/just greeting words
+  if (n.length <= 14 && GREETINGS.some(g => n.includes(g))) return true;
+  return false;
+}
+function isHairSkinQuery(s) {
+  const n = normalizeAr(s);
+  let hits = 0;
+  HAIR_SKIN_HINTS.forEach(h => { if (n.includes(h)) hits++; });
+  return hits >= 1; // at least one hint
 }
 
-const SMALL_TALK_RESPONSES = {
-  greet: [
-    'اهلا وسهلا! 👋 ازيك؟ لو حابة نتكلم عن روتين شعر طفلك قوليلي سنه ونوع الشعر.',
-    'مرحبا بيكي! 😊 اقدر اساعدك ازاي؟'
-  ],
-  how: [
-    'تمام الحمد لله 🙏 انتي عاملة ايه؟ لو في استفسار عن العناية بشعر الأطفال انا جاهزة.',
-  ],
-  thanks: [
-    'العفو 🙌 لو احتجتي اي حاجة تانية انا هنا.',
-  ],
-  bye: [
-    'باي 👋 يسعدني نكمل كلامنا في اي وقت.',
-  ],
-};
+// === Fuse index for product intents ===
+const fusedData = customReplies.map(it => ({
+  ...it,
+  _normTrigger: normalizeAr(it.trigger || ''),
+  _normKeywords: (it.keywords || []).map(normalizeAr),
+  _normExamples: (it.examples || []).map(normalizeAr)
+}));
 
-// === Build fuzzy index over intents ===
-const fuse = new Fuse(
-  customReplies.map(it => ({
-    ...it,
-    _normTrigger: normalizeAr(it.trigger || ''),
-    _normKeywords: (it.keywords || []).map(normalizeAr),
-    _normExamples: (it.examples || []).map(normalizeAr)
-  })),
-  {
-    includeScore: true,
-    threshold: 0.30, // a bit stricter to avoid over-firing
-    keys: ['_normTrigger', '_normKeywords', '_normExamples', 'reply.title', 'reply.description']
-  }
-);
-
-// Helper to count keyword hits in user message
-function keywordHitCount(userNorm, keywords = []) {
-  const ks = keywords.map(normalizeAr).filter(Boolean);
-  let c = 0;
-  for (const k of ks) if (userNorm.includes(k)) c++;
-  return c;
-}
+const fuse = new Fuse(fusedData, {
+  includeScore: true,
+  threshold: 0.34, // a bit stricter
+  keys: ['_normTrigger', '_normKeywords', '_normExamples', 'reply.title', 'reply.description']
+});
 
 // === HANDLE INCOMING MESSAGES ===
 app.post('/webhook', async (req, res) => {
@@ -116,25 +97,21 @@ app.post('/webhook', async (req, res) => {
 
         const senderId = event.sender?.id;
         const text = event.message?.text;
-        const attachments = event.message?.attachments || [];
         const postback = event.postback?.payload;
-
-        let userMessage = (text || postback || '').toString().trim();
+        const attachments = event.message?.attachments || [];
+        const userMessage = (text || postback || '').toString().trim();
+        if (!senderId) continue;
 
         if (!userMessage && attachments.length) {
-          await sendReply(
-            senderId,
-            'استقبلت مرفق 😊 لو تحبّي أقدر أساعدك أكتر لما تبعتي سؤالك نصًا عن شعر الطفل أو المنتجات.'
-          );
+          await sendReply(senderId, 'استقبلت مرفق 😊 ابعتي سؤالك نصًا علشان اقدر اساعدك بسرعة.');
           continue;
         }
+        if (!userMessage) continue;
 
-        if (!senderId || !userMessage) continue;
-
-        const finalReply = await getSmartReply(userMessage);
         await sendTypingOn(senderId);
+        const reply = await routeAndReply(userMessage);
         await delay(700);
-        await sendReply(senderId, finalReply);
+        await sendReply(senderId, reply);
       }
     }
     return res.sendStatus(200);
@@ -144,93 +121,81 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-// === SMART REPLY flow ===
-async function getSmartReply(userMessage) {
+// === Router: decide how to answer ===
+async function routeAndReply(userMessage) {
   try {
-    // 1) Small talk first (no product pitch)
-    const st = matchSmallTalk(userMessage);
-    if (st) {
-      const variants = SMALL_TALK_RESPONSES[st] || [];
-      const reply = variants[Math.floor(Math.random() * variants.length)] || 'اهلا بيكي 👋';
-      return reply;
+    // 1) small talk → friendly, brief, ask how to help (no sales)
+    if (isSmallTalk(userMessage)) {
+      return await callGPT({
+        persona: basePersona({ mode: 'smalltalk' }),
+        user: `تحية/سؤال قصير من المستخدم: "${userMessage}".
+أجب بتحية قصيرة دافئة وبسؤال واحد بسيط: تحبّي اساعدك في ايه بخصوص شعر او بشرة طفلك؟`,
+        tokens: 120
+      });
     }
 
-    // 2) Try custom intents (require BOTH: confident score AND at least 1 keyword hit)
-    const norm = normalizeAr(userMessage);
-    const results = fuse.search(norm);
-    const top = results[0];
-    let confident = false;
-    let matchedIntent = null;
+    // 2) hair/skin → expert answer + (optional) subtle link to relevant product data
+    if (isHairSkinQuery(userMessage)) {
+      // try to find one or two relevant intents (ingredients / safety / routine / offer)
+      const hits = fuse.search(normalizeAr(userMessage)).slice(0, 2).map(r => r.item.reply);
+      const context = JSON.stringify(hits, null, 2);
 
-    if (top && top.score !== undefined && top.score <= 0.30) {
-      const hits = keywordHitCount(norm, top.item.keywords || []);
-      if (hits > 0) {
-        confident = true;
-        matchedIntent = top.item;
-      }
+      return await callGPT({
+        persona: basePersona({ mode: 'expert' }),
+        user:
+`سؤال العميل عن العناية بالشعر/البشرة: """${userMessage}"""
+معلومات منتجات قد تكون مفيدة (استخدمها كمرجع فقط ولا تنقلها حرفيًا):
+${context}
+
+اكتب ردًا طبيًا بسيطًا ولطيفًا: 1) افهم الحالة باختصار، 2) قدّم نصيحة عملية خطوة بخطوة تناسب الأطفال،
+3) إن كانت هناك ملائمة واضحة جدًا، اقترح منتجًا واحدًا من البيانات مع سبب مختصر،
+4) اسأل سؤال متابعة واحد لتخصيص النصيحة (سن الطفل/نوع الشعر/شدة المشكلة).`,
+        tokens: 380
+      });
     }
 
-    // 3) Build persona for GPT
-    const persona = `
-أنت طبيب أطفال وخبير عناية بشعر وبشرة الأطفال في شركة SmartKidz.
-تتكلم بلغة مصرية مهذبة ودافئة. الهدف: حوار طبيعي أولًا، ثم المساعدة.
-لا تقدم عرض منتج إلا عند وجود طلب واضح أو تطابق مع الكلمات المفتاحية.
-لو السؤال عام وغير واضح، اسأل سؤال توضيحي قصير.
-نوّه أن الاستجابة تختلف من طفل لآخر وتجنب الوعود القطعية.
-`;
-
-    // 4) If clear product intent → let GPT rephrase our product info nicely (plus media)
-    if (confident && matchedIntent) {
-      const systemPrompt = persona + `
-هذه بيانات داخلية عن منتج/عرض SmartKidz لا تُعرض حرفيًا:
-${JSON.stringify(matchedIntent.reply, null, 2)}
-
-التعليمات:
-- رد باختصار إنساني ولطيف بناءً على سؤال المستخدم.
-- لا تسوق بشكل مباشر إلا لو السؤال يطلب ذلك.
-- إن احتجت، اسأل سؤال توضيحي واحد بحد أقصى.
-- لا تقدم ادعاءات علاجية.
-`;
-      const text = await callGpt(systemPrompt, userMessage);
-
-      // attach images/gallery if any
-      const media = [];
-      const r = matchedIntent.reply || {};
-      if (r.image) media.push(r.image);
-      if (Array.isArray(r.gallery)) media.push(...r.gallery.filter(Boolean));
-
-      return formatReply(text, media);
-    }
-
-    // 5) Otherwise → general chat: be human, ask 1 clarifying question, no pitch
-    const systemPrompt = persona + `
-لا تقدم معلومات عن المنتجات الآن إلا لو المستخدم طلبها صراحة.
-ابدأ برد بشري طبيعي ثم اسأل سؤال توضيحي واحد متعلق بالشعر أو الهدف.
-`;
-    const text = await callGpt(systemPrompt, userMessage);
-    return text || 'تمام 👌 ممكن توضحيلي هدفك؟ تقليل هيشان؟ فك تشابك؟ ترطيب؟';
-
+    // 3) general → normal assistant
+    return await callGPT({
+      persona: basePersona({ mode: 'general' }),
+      user:
+`سؤال عام من العميل: """${userMessage}"""
+أجب بإيجاز وبشكل مفيد. لو ينفع تربط بنصيحة عناية بالأطفال أو بنقطة منطقية من منتجات SmartKidz فلتكن إشارة خفيفة جدًا فقط.`,
+      tokens: 280
+    });
   } catch (e) {
-    console.error('❌ getSmartReply error:', e?.response?.data || e.message);
+    console.error('❌ route error:', e?.response?.data || e.message);
     return 'عذرًا، حصلت مشكلة مؤقتة—ممكن نجرب تاني؟';
   }
 }
 
-// === OpenAI call (GPT-5/mini friendly) ===
-async function callGpt(systemPrompt, userPrompt) {
+// === Persona builder ===
+function basePersona({ mode }) {
+  const core = `
+أنت طبيب أطفال وخبير عناية بشعر وبشرة الأطفال لدى SmartKidz.
+تتكلم بلغة مصرية مهذبة ودافئة. دقيقة وبدون وعود علاجية قطعية.
+تذكير مهم: الاستجابة قد تختلف من طفل لآخر؛ لا تعطي تشخيص طبي.`;
+  const small = `الهدف: تحية قصيرة وودية + سؤال متابعة واحد لمعرفة الحاجة. لا تعرض منتجات.`;
+  const expert = `الهدف: فهم المشكلة وتقديم خطوات عملية آمنة، ثم اقتراح منتج واحد فقط إذا كان مناسبًا بوضوح.`;
+  const general = `الهدف: إجابة عامة مفيدة. لا تعرض منتجات إلا لو منطقي جدًا وبجملة واحدة.`;
+  if (mode === 'smalltalk') return `${core}\n${small}`;
+  if (mode === 'expert') return `${core}\n${expert}`;
+  return `${core}\n${general}`;
+}
+
+// === GPT caller (handles gpt-5 vs others) ===
+async function callGPT({ persona, user, tokens = 300 }) {
   const isGpt5 = /^gpt-5/i.test(GPT_MODEL);
   const payload = {
     model: GPT_MODEL,
     messages: [
-      { role: 'system', content: systemPrompt },
-      { role: 'user', content: userPrompt }
+      { role: 'system', content: persona },
+      { role: 'user', content: user }
     ]
   };
-  if (isGpt5) {
-    payload.max_completion_tokens = 400;
-  } else {
+  if (isGpt5) payload.max_completion_tokens = Math.min(tokens, 500);
+  else {
     payload.temperature = 0.65;
-    payload.max_tokens = 400;
+    payload.max_tokens = Math.min(tokens, 500);
   }
 
   const { data } = await axios.post(OPENAI_API_URL, payload, {
@@ -238,24 +203,11 @@ async function callGpt(systemPrompt, userPrompt) {
     timeout: 15000
   });
 
-  let text = (data.choices?.[0]?.message?.content || '').trim();
-  if (!text) {
-    text = 'تمام 👌 احكيلي سن الطفل ونوع الشعر والمشكلة الأساسية (هيشان/جفاف/تشابك).';
-  }
-  console.log('GPT preview:', text.slice(0, 200));
-  return text;
+  return (data.choices?.[0]?.message?.content || '').trim();
 }
 
-// === Helper: combine text + image URLs into one message string ===
-function formatReply(text = '', imageUrls = []) {
-  const safeText = (text || '').trim();
-  const mediaLines = (imageUrls || []).map(u => String(u).trim()).filter(Boolean);
-  return [safeText, ...mediaLines].filter(Boolean).join('\n');
-}
-
-// === SEND TYPING ===
+// === Messenger helpers ===
 async function sendTypingOn(recipientId) {
-  if (!recipientId) return;
   try {
     await axios.post(
       `https://graph.facebook.com/v17.0/me/messages?access_token=${PAGE_ACCESS_TOKEN}`,
@@ -266,26 +218,17 @@ async function sendTypingOn(recipientId) {
   }
 }
 
-// === SEND MESSAGE (supports images & multi-line) ===
 async function sendReply(recipientId, replyContent) {
-  if (!recipientId) return;
   try {
-    let parts = String(replyContent).split('\n').map(p => p.trim()).filter(Boolean);
-
-    if (!parts.length) {
-      parts = [
-        'تمام 🙌 ابعتيلي سن الطفل، نوع الشعر (ناعم/مموج/كيرلي)، والمشكلة الأساسية (هيشان/جفاف/تشابك)، وأنا أختارلك الروتين المناسب.'
-      ];
-    }
-
+    const parts = String(replyContent).split('\n').filter(p => p.trim());
     for (const part of parts) {
-      const isUrl = /^https?:\/\/\S+$/i.test(part);
+      const isUrl = /^https?:\/\/\S+$/i.test(part.trim());
       if (isUrl) {
         await axios.post(
           `https://graph.facebook.com/v17.0/me/messages?access_token=${PAGE_ACCESS_TOKEN}`,
           {
             recipient: { id: recipientId },
-            message: { attachment: { type: 'image', payload: { url: part, is_reusable: true } } }
+            message: { attachment: { type: 'image', payload: { url: part.trim(), is_reusable: true } } }
           }
         );
       } else {
@@ -294,10 +237,10 @@ async function sendReply(recipientId, replyContent) {
             `https://graph.facebook.com/v17.0/me/messages?access_token=${PAGE_ACCESS_TOKEN}`,
             { recipient: { id: recipientId }, message: { text: chunk } }
           );
-          await delay(200);
+          await delay(180);
         }
       }
-      await delay(250);
+      await delay(220);
     }
   } catch (e) {
     console.error('Send error:', e?.response?.data || e.message);
@@ -307,15 +250,11 @@ async function sendReply(recipientId, replyContent) {
 // === Utils ===
 function delay(ms) { return new Promise(r => setTimeout(r, ms)); }
 function chunkText(str, max = 1800) {
-  const s = String(str);
-  if (s.length <= max) return [s];
-  const out = [];
-  for (let i = 0; i < s.length; i += max) out.push(s.slice(i, i + max));
+  const s = String(str); if (s.length <= max) return [s];
+  const out = []; for (let i = 0; i < s.length; i += max) out.push(s.slice(i, i + max));
   return out;
 }
 
 // === START ===
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () =>
-  console.log(`🚀 Server running on port ${PORT} (model: ${GPT_MODEL})`)
-);
+app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT} (model: ${GPT_MODEL})`));
