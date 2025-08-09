@@ -15,7 +15,6 @@ const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 const PAGE_ACCESS_TOKEN = process.env.PAGE_ACCESS_TOKEN;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const OPENAI_API_URL = 'https://api.openai.com/v1/chat/completions';
-// Default to gpt-5-mini; override with env if you like
 const GPT_MODEL = process.env.GPT_MODEL || 'gpt-5-mini';
 
 // === HEALTH CHECK ===
@@ -59,13 +58,7 @@ const fuse = new Fuse(
   {
     includeScore: true,
     threshold: 0.36,
-    keys: [
-      '_normTrigger',
-      '_normKeywords',
-      '_normExamples',
-      'reply.title',
-      'reply.description'
-    ]
+    keys: ['_normTrigger', '_normKeywords', '_normExamples', 'reply.title', 'reply.description']
   }
 );
 
@@ -76,7 +69,6 @@ app.post('/webhook', async (req, res) => {
 
     for (const entry of req.body.entry) {
       for (const event of entry.messaging) {
-        // Ignore echoes & delivery events
         if (event.message && event.message.is_echo) continue;
 
         const senderId = event.sender?.id;
@@ -86,7 +78,6 @@ app.post('/webhook', async (req, res) => {
 
         let userMessage = (text || postback || '').toString().trim();
 
-        // Basic handling for attachments (photos/voice) → nudge user
         if (!userMessage && attachments.length) {
           await sendReply(
             senderId,
@@ -160,20 +151,23 @@ ${JSON.stringify(
       userPrompt = userMessage;
     }
 
-    // Build payload with correct token limit field
+    // Build payload with correct fields for the selected model
     const isGpt5 = /^gpt-5/i.test(GPT_MODEL);
     const payload = {
       model: GPT_MODEL,
       messages: [
         { role: 'system', content: systemPrompt },
         { role: 'user', content: userPrompt }
-      ],
-      temperature: 0.65
+      ]
     };
+
     if (isGpt5) {
-      payload.max_completion_tokens = 450; // GPT-5 expects this field
+      // GPT-5 family: no custom temperature (defaults to 1), and uses max_completion_tokens
+      payload.max_completion_tokens = 450;
     } else {
-      payload.max_tokens = 450; // older models (e.g., gpt-4o)
+      // Older models: support temperature + max_tokens
+      payload.temperature = 0.65;
+      payload.max_tokens = 450;
     }
 
     const { data } = await axios.post(OPENAI_API_URL, payload, {
@@ -266,4 +260,6 @@ function chunkText(str, max = 1800) {
 
 // === START ===
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT} (model: ${GPT_MODEL})`));
+app.listen(PORT, () =>
+  console.log(`🚀 Server running on port ${PORT} (model: ${GPT_MODEL})`)
+);
