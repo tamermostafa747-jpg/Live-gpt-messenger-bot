@@ -21,8 +21,6 @@ const GPT_MODEL         = process.env.GPT_MODEL || 'gpt-5-mini';
 
 // ===== Simple sessions (memory) =====
 const SESSIONS = new Map();
-// structure:
-// { slots: { age, hairType, concern, audience }, asked: { age, hairType, concern }, askCount, lastAskedAt, lastTurnAt }
 const newSession = () => ({
   slots: { age: null, hairType: null, concern: null, audience: 'child' }, // 'child' | 'adult'
   asked: { age: false, hairType: false, concern: false },
@@ -48,32 +46,23 @@ function isGreeting(t) {
   const n = normalizeAr(t);
   return n && n.length <= 20 && GREET_WORDS.some(g => n.includes(g));
 }
-
-// detect adult wording
 function saysAdult(t) {
   const n = normalizeAr(t);
-  return /انا مش طفل|انا كبير|انا شخص كبير|انا بالغ|لشعري انا|شعري انا/i.test(n);
+  return /انا مش طفل|انا كبير|انا شخص كبير|انا بالغ|لشعري انا|شعري انا/.test(n);
 }
-
-// quick slot extraction
 function extractSlots(text) {
   const n = normalizeAr(text);
   const out = {};
-
-  // age like: "10 سنين" / "6 سنه" / "عمره 8"
   const mAge = n.match(/(^|\s)(\d{1,2})\s*(س|سن|سنه|سنين)(\s|$)/);
   if (mAge) out.age = mAge[2];
-
   if (n.includes('مجعد') || n.includes('كيرلي')) out.hairType = 'مجعد/كيرلي';
   else if (n.includes('ناعم')) out.hairType = 'ناعم';
   else if (n.includes('خشن')) out.hairType = 'خشن';
-
   if (n.includes('هيشان')) out.concern = 'هيشان';
   else if (n.includes('جفاف')) out.concern = 'جفاف';
   else if (n.includes('تقصف')) out.concern = 'تقصف';
   else if (n.includes('قشره') || n.includes('قشرة')) out.concern = 'قشرة';
   else if (n.includes('تساقط')) out.concern = 'تساقط';
-
   return out;
 }
 
@@ -117,8 +106,8 @@ app.post('/webhook', (req, res) => {
     if (req.body.object !== 'page') return res.sendStatus(404);
     res.sendStatus(200);
 
-    for (const entry of req.body.entry || []) {
-      for (const event of entry.messaging || []) {
+    for (const entry of (req.body.entry || [])) {
+      for (const event of (entry.messaging || [])) {
         handleEvent(event).catch(err => console.error('handleEvent error:', err?.response?.data || err.message));
       }
     }
@@ -131,15 +120,14 @@ async function handleEvent(event) {
   if (event.message && event.message.is_echo) return;
 
   const senderId   = event.sender?.id;
-  const text       = event.message?.text || event.postback?.payload || '';
+  const msgText    = event.message?.text || event.postback?.payload || '';
   const attachments= event.message?.attachments || [];
-  const userMsg    = String(text).trim();
+  const userMsg    = String(msgText).trim();
   if (!senderId) return;
 
   const s = SESSIONS.get(senderId) || newSession();
   s.lastTurnAt = Date.now();
 
-  // attachments only -> nudge to text
   if (!userMsg && attachments.length) {
     await sendReply(senderId, 'استقبلت مرفق 😊 لو تكتبي سؤالك عن الشعر/البشرة، اقدر اساعدك بسرعة.');
     SESSIONS.set(senderId, s);
@@ -147,23 +135,19 @@ async function handleEvent(event) {
   }
   if (!userMsg) { SESSIONS.set(senderId, s); return; }
 
-  // detect adult context early
   if (saysAdult(userMsg)) s.slots.audience = 'adult';
 
-  // capture slots from the message
   const found = extractSlots(userMsg);
   s.slots = { ...s.slots, ...found };
 
   await sendTypingOn(senderId);
 
-  // 1) Greeting → friendly & open question, no product pushes
   if (isGreeting(userMsg)) {
     await sendReply(senderId, 'اهلا بيكي 👋 ازاي اقدر اساعدك؟ لو تحبي، احكيلي النوع/المشكلة بسرعة (مثلا: هيشان لشعر كيرلي).');
     SESSIONS.set(senderId, s);
     return;
   }
 
-  // 2) FAQs / offers / safety
   const intentHit = fuseIntents.search(normalizeAr(userMsg))?.[0];
   if (intentHit && intentHit.score <= 0.32) {
     const R = intentHit.item.reply || {};
@@ -179,28 +163,26 @@ async function handleEvent(event) {
     return;
   }
 
-  // 3) Hair/skin help → retrieve relevant product facts, ask at most one *new* follow-up (never repeat)
   const n = normalizeAr(userMsg);
   const topProducts = fuseProducts.search(n).slice(0, 3).map(r => r.item);
   const productsCtx = JSON.stringify(topProducts.map(p => ({
     name: p.name, benefits: p.benefits, ingredients: p.ingredients, notes: p.notes
   })), null, 2);
 
-  // choose ONE missing slot to ask, with shield against repetition
   const now = Date.now();
-  const COOL_MS = 35_000; // don’t ask again within 35s
+  const COOL_MS = 35_000;
   let followUp = '';
 
   const canAsk =
-    s.askCount < 2 &&                         // don’t keep quizzing
-    now - s.lastAskedAt > COOL_MS;           // throttle
+    s.askCount < 2 &&
+    now - s.lastAskedAt > COOL_MS;
 
   const need = [];
   if (s.slots.audience === 'child') {
-    if (!s.slots.age)      need.push('age');
+    if (!s.slots.age) need.push('age');
   }
-  if (!s.slots.hairType)  need.push('hairType');
-  if (!s.slots.concern)   need.push('concern');
+  if (!s.slots.hairType) need.push('hairType');
+  if (!s.slots.concern)  need.push('concern');
 
   for (const slot of need) {
     if (canAsk && !s.asked[slot]) {
@@ -228,8 +210,8 @@ async function handleEvent(event) {
 4) ${followUp ? `اسأل *هذا السؤال فقط* في النهاية: "${followUp}"` : 'لا تسأل أي أسئلة إضافية الآن.'}
 `;
 
-  const text = await callGPT({ persona, user: userPrompt, tokens: 420 });
-  await sendReply(senderId, text || (followUp || 'تمام ✅'));
+  const answer = await callGPT({ persona, user: userPrompt, tokens: 420 });
+  await sendReply(senderId, answer || (followUp || 'تمام ✅'));
 
   SESSIONS.set(senderId, s);
 }
