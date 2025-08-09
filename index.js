@@ -5,28 +5,33 @@ const axios = require('axios');
 const Fuse = require('fuse.js');
 require('dotenv').config();
 
-const intents  = require('./customReplies');  // FAQs / Offers / Safety...
-const products = require('./productData');    // Product facts (easy to update)
+const intents  = require('./customReplies');   // FAQs / offers / safety
+const products = require('./productData');     // Product facts (you can update freely)
 
-// --- App & config ---
+// ===== App & config =====
 const app = express();
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 
-const VERIFY_TOKEN     = process.env.VERIFY_TOKEN;
+const VERIFY_TOKEN      = process.env.VERIFY_TOKEN;
 const PAGE_ACCESS_TOKEN = process.env.PAGE_ACCESS_TOKEN;
-const OPENAI_API_KEY   = process.env.OPENAI_API_KEY;
-const OPENAI_API_URL   = 'https://api.openai.com/v1/chat/completions';
-const GPT_MODEL        = process.env.GPT_MODEL || 'gpt-5-mini';
+const OPENAI_API_KEY    = process.env.OPENAI_API_KEY;
+const OPENAI_API_URL    = 'https://api.openai.com/v1/chat/completions';
+const GPT_MODEL         = process.env.GPT_MODEL || 'gpt-5-mini';
 
-// --- Simple in-memory sessions ---
-const SESSIONS = new Map(); // key: senderId -> { slots, lastTurnAt }
+// ===== Simple sessions (memory) =====
+const SESSIONS = new Map();
+// structure:
+// { slots: { age, hairType, concern, audience }, asked: { age, hairType, concern }, askCount, lastAskedAt, lastTurnAt }
 const newSession = () => ({
-  slots: { age: null, hairType: null, concern: null },
+  slots: { age: null, hairType: null, concern: null, audience: 'child' }, // 'child' | 'adult'
+  asked: { age: false, hairType: false, concern: false },
+  askCount: 0,
+  lastAskedAt: 0,
   lastTurnAt: Date.now()
 });
 
-// --- Helpers: normalize Arabic, greetings ---
+// ===== Arabic helpers =====
 function normalizeAr(str = '') {
   return String(str).toLowerCase()
     .replace(/[ًٌٍَُِّْـ]/g, '')
@@ -37,15 +42,42 @@ function normalizeAr(str = '') {
     .replace(/ة/g, 'ه')
     .trim();
 }
-const GREET_WORDS = [
-  'hi','hello','hey','الو','هاي','هلا','مرحبا','صباح الخير','مساء الخير','ازيك','عامل ايه','عامله ايه'
-].map(normalizeAr);
+
+const GREET_WORDS = ['hi','hello','hey','الو','هاي','هلا','مرحبا','صباح الخير','مساء الخير','ازيك','عامل ايه','عامله ايه'].map(normalizeAr);
 function isGreeting(t) {
   const n = normalizeAr(t);
   return n && n.length <= 20 && GREET_WORDS.some(g => n.includes(g));
 }
 
-// --- Fuse: intents (FAQs) ---
+// detect adult wording
+function saysAdult(t) {
+  const n = normalizeAr(t);
+  return /انا مش طفل|انا كبير|انا شخص كبير|انا بالغ|لشعري انا|شعري انا/i.test(n);
+}
+
+// quick slot extraction
+function extractSlots(text) {
+  const n = normalizeAr(text);
+  const out = {};
+
+  // age like: "10 سنين" / "6 سنه" / "عمره 8"
+  const mAge = n.match(/(^|\s)(\d{1,2})\s*(س|سن|سنه|سنين)(\s|$)/);
+  if (mAge) out.age = mAge[2];
+
+  if (n.includes('مجعد') || n.includes('كيرلي')) out.hairType = 'مجعد/كيرلي';
+  else if (n.includes('ناعم')) out.hairType = 'ناعم';
+  else if (n.includes('خشن')) out.hairType = 'خشن';
+
+  if (n.includes('هيشان')) out.concern = 'هيشان';
+  else if (n.includes('جفاف')) out.concern = 'جفاف';
+  else if (n.includes('تقصف')) out.concern = 'تقصف';
+  else if (n.includes('قشره') || n.includes('قشرة')) out.concern = 'قشرة';
+  else if (n.includes('تساقط')) out.concern = 'تساقط';
+
+  return out;
+}
+
+// ===== Search indexes =====
 const fuseIntents = new Fuse(
   intents.map(x => ({
     ...x,
@@ -56,7 +88,6 @@ const fuseIntents = new Fuse(
   { includeScore: true, threshold: 0.32, keys: ['_tr','_kw','_ex','reply.title','reply.description'] }
 );
 
-// --- Fuse: product retrieval (title/benefits/ingredients) ---
 const fuseProducts = new Fuse(
   products.map(p => ({
     ...p,
@@ -68,29 +99,27 @@ const fuseProducts = new Fuse(
   { includeScore: true, threshold: 0.38, keys: ['_name','_tags','_benefits','_ing','notes'] }
 );
 
-// --- Health & webhook verify ---
-app.get('/', (_req, res) => res.status(200).send('SmartKidz bot ✅'));
-app.get('/health', (_req, res) => res.status(200).json({ ok: true }));
+// ===== Health & verify =====
+app.get('/',        (_req, res) => res.status(200).send('SmartKidz bot ✅'));
+app.get('/health',  (_req, res) => res.status(200).json({ ok: true }));
 
 app.get('/webhook', (req, res) => {
-  const mode = req.query['hub.mode'];
-  const token = req.query['hub.verify_token'];
+  const mode      = req.query['hub.mode'];
+  const token     = req.query['hub.verify_token'];
   const challenge = req.query['hub.challenge'];
   if (mode === 'subscribe' && token === VERIFY_TOKEN) return res.status(200).send(challenge);
   return res.sendStatus(403);
 });
 
-// --- Messenger webhook (ack first, process async) ---
+// ===== Messenger webhook (ack first, process async) =====
 app.post('/webhook', (req, res) => {
   try {
     if (req.body.object !== 'page') return res.sendStatus(404);
-    res.sendStatus(200); // ACK immediately to avoid Messenger timeouts
+    res.sendStatus(200);
 
     for (const entry of req.body.entry || []) {
       for (const event of entry.messaging || []) {
-        handleEvent(event).catch(err =>
-          console.error('handleEvent error:', err?.response?.data || err.message)
-        );
+        handleEvent(event).catch(err => console.error('handleEvent error:', err?.response?.data || err.message));
       }
     }
   } catch (e) {
@@ -103,129 +132,132 @@ async function handleEvent(event) {
 
   const senderId   = event.sender?.id;
   const text       = event.message?.text || event.postback?.payload || '';
-  const attachments = event.message?.attachments || [];
+  const attachments= event.message?.attachments || [];
   const userMsg    = String(text).trim();
   if (!senderId) return;
 
-  // create/refresh session
   const s = SESSIONS.get(senderId) || newSession();
   s.lastTurnAt = Date.now();
-  SESSIONS.set(senderId, s);
 
   // attachments only -> nudge to text
   if (!userMsg && attachments.length) {
-    await sendReply(senderId, 'استقبلت مرفق 😊 لو تكتبي سؤالك عن شعر/بشرة طفلك، أقدر أساعدك بشكل أدق.');
+    await sendReply(senderId, 'استقبلت مرفق 😊 لو تكتبي سؤالك عن الشعر/البشرة، اقدر اساعدك بسرعة.');
+    SESSIONS.set(senderId, s);
     return;
   }
-  if (!userMsg) return;
+  if (!userMsg) { SESSIONS.set(senderId, s); return; }
+
+  // detect adult context early
+  if (saysAdult(userMsg)) s.slots.audience = 'adult';
+
+  // capture slots from the message
+  const found = extractSlots(userMsg);
+  s.slots = { ...s.slots, ...found };
 
   await sendTypingOn(senderId);
 
-  // 1) Friendly greeting
+  // 1) Greeting → friendly & open question, no product pushes
   if (isGreeting(userMsg)) {
-    await sendReply(
-      senderId,
-      'اهلا بيكي 👋 انا هنا اساعدك في العناية بشعر وبشرة الأطفال. تحبي نبدأ بسؤال صغير: سن الطفل ونوع الشعر ايه؟'
-    );
+    await sendReply(senderId, 'اهلا بيكي 👋 ازاي اقدر اساعدك؟ لو تحبي، احكيلي النوع/المشكلة بسرعة (مثلا: هيشان لشعر كيرلي).');
+    SESSIONS.set(senderId, s);
     return;
   }
 
-  // 2) FAQs / Offers / Safety (precise)
+  // 2) FAQs / offers / safety
   const intentHit = fuseIntents.search(normalizeAr(userMsg))?.[0];
   if (intentHit && intentHit.score <= 0.32) {
-    const { reply: R } = intentHit.item;
+    const R = intentHit.item.reply || {};
     const blocks = [];
-    if (R.title) blocks.push(`• ${R.title}`);
+    if (R.title)       blocks.push(`• ${R.title}`);
     if (R.description) blocks.push(R.description);
-    if (Array.isArray(R.highlights) && R.highlights.length) {
-      blocks.push(R.highlights.map(h => `- ${h}`).join('\n'));
-    }
-    const out = blocks.join('\n\n').trim();
-    await sendReply(senderId, out || 'تمام ✅');
+    if (Array.isArray(R.highlights) && R.highlights.length) blocks.push(R.highlights.map(h => `- ${h}`).join('\n'));
+    const out = blocks.join('\n\n').trim() || 'تمام ✅';
+    await sendReply(senderId, out);
     if (R.image) await sendReply(senderId, R.image);
-    if (Array.isArray(R.gallery)) {
-      for (const img of R.gallery) await sendReply(senderId, img);
-    }
+    if (Array.isArray(R.gallery)) for (const img of R.gallery) await sendReply(senderId, img);
+    SESSIONS.set(senderId, s);
     return;
   }
 
-  // 3) Open hair/skin help → retrieve product facts, fill slots
+  // 3) Hair/skin help → retrieve relevant product facts, ask at most one *new* follow-up (never repeat)
   const n = normalizeAr(userMsg);
   const topProducts = fuseProducts.search(n).slice(0, 3).map(r => r.item);
-  const ctx = JSON.stringify(
-    topProducts.map(p => ({
-      name: p.name,
-      benefits: p.benefits,
-      ingredients: p.ingredients,
-      notes: p.notes
-    })), null, 2
-  );
+  const productsCtx = JSON.stringify(topProducts.map(p => ({
+    name: p.name, benefits: p.benefits, ingredients: p.ingredients, notes: p.notes
+  })), null, 2);
 
-  // auto-capture simple values
-  if (!s.slots.age) {
-    const m = userMsg.match(/\b(\d{1,2})\s*(س|سن|سنه|سنين)\b/);
-    if (m) s.slots.age = m[1];
-  }
-  if (!s.slots.hairType) {
-    if (n.includes('مجعد') || n.includes('كيرلي')) s.slots.hairType = 'مجعد/كيرلي';
-    else if (n.includes('ناعم')) s.slots.hairType = 'ناعم';
-    else if (n.includes('خشن')) s.slots.hairType = 'خشن';
-  }
-  if (!s.slots.concern) {
-    if (n.includes('هيشان')) s.slots.concern = 'هيشان';
-    else if (n.includes('جفاف')) s.slots.concern = 'جفاف';
-    else if (n.includes('تقصف')) s.slots.concern = 'تقصف';
-    else if (n.includes('قشره') || n.includes('قشرة')) s.slots.concern = 'قشرة';
-    else if (n.includes('تساقط')) s.slots.concern = 'تساقط';
-  }
-
-  // ask for one missing slot (max) to keep flow smooth
+  // choose ONE missing slot to ask, with shield against repetition
+  const now = Date.now();
+  const COOL_MS = 35_000; // don’t ask again within 35s
   let followUp = '';
-  if (!s.slots.age)         followUp = 'تمام — سن الطفل كام؟';
-  else if (!s.slots.hairType) followUp = 'نوع الشعر ايه؟ (مجعد/ناعم/خشن)';
-  else if (!s.slots.concern)  followUp = 'المشكلة الأساسية ايه؟ (هيشان/جفاف/تقصف/قشرة/تساقط)';
 
-  const persona = `
-أنت طبيب أطفال وخبير عناية بشعر/بشرة الأطفال لدى SmartKidz.
-- تحدث باللهجة المصرية بأسلوب دافئ ومحترم.
-- قدم نصيحة عملية وخطوات بسيطة آمنة، بلا وعود علاجية قطعية.
-- إن كان هناك تطابق واضح جدًا مع منتج في "بيانات المنتجات" اقترح منتجًا واحدًا فقط وبجملة قصيرة عن السبب.
-- إن لم تكن واثقًا، لا تقترح منتجًا.
-- لا تكرر نفس السؤال؛ اسأل سؤال متابعة واحد فقط عند الحاجة.
-`;
+  const canAsk =
+    s.askCount < 2 &&                         // don’t keep quizzing
+    now - s.lastAskedAt > COOL_MS;           // throttle
+
+  const need = [];
+  if (s.slots.audience === 'child') {
+    if (!s.slots.age)      need.push('age');
+  }
+  if (!s.slots.hairType)  need.push('hairType');
+  if (!s.slots.concern)   need.push('concern');
+
+  for (const slot of need) {
+    if (canAsk && !s.asked[slot]) {
+      if (slot === 'age')      followUp = 'سن الطفل كام؟';
+      if (slot === 'hairType') followUp = 'نوع الشعر ايه؟ (مجعد/ناعم/خشن)';
+      if (slot === 'concern')  followUp = 'المشكلة الأساسية ايه؟ (هيشان/جفاف/تقصف/قشرة/تساقط)';
+      s.asked[slot]  = true;
+      s.askCount    += 1;
+      s.lastAskedAt  = now;
+      break;
+    }
+  }
+
+  const persona = buildPersona(s.slots.audience);
 
   const userPrompt = `
 رسالة العميل: """${userMsg}"""
-بيانات الجلسة: ${JSON.stringify(s.slots)}
-بيانات المنتجات (مرجع اختياري): ${ctx}
+سياق الجلسة: ${JSON.stringify(s.slots)}
+بيانات المنتجات (مرجع اختياري): ${productsCtx}
 
 اكتب ردًا طبيعيًا وقصيرًا:
 1) افهم الحالة باختصار.
-2) أعطِ خطوات بسيطة مناسبة للأطفال.
-3) إن كان منطقيًا جدًا، رشّح منتجًا واحدًا من المرجع مع سبب مختصر (سطر واحد).
-4) ${followUp ? `ثم اسأل هذا السؤال فقط: "${followUp}"` : 'لا تسأل أي أسئلة إضافية الآن.'}
+2) قدم خطوات عملية آمنة (3 نقاط بحد أقصى).
+3) إن كان منطقيًا جدًا، رشّح منتجًا واحدًا من المرجع مع سبب مختصر (سطر واحد). لا تذكر أكثر من منتج.
+4) ${followUp ? `اسأل *هذا السؤال فقط* في النهاية: "${followUp}"` : 'لا تسأل أي أسئلة إضافية الآن.'}
 `;
 
-  const gptReply = await callGPT({ persona, user: userPrompt, tokens: 420 });
-  await sendReply(senderId, gptReply || (followUp || 'تمام ✅'));
+  const text = await callGPT({ persona, user: userPrompt, tokens: 420 });
+  await sendReply(senderId, text || (followUp || 'تمام ✅'));
+
   SESSIONS.set(senderId, s);
 }
 
-// --- GPT call (GPT-5 uses max_completion_tokens only) ---
+// ===== Persona =====
+function buildPersona(audience = 'child') {
+  const core = `
+أنت خبير عناية بالشعر والبشرة لدى SmartKidz.
+تتكلم باللهجة المصرية بلطف واحترام، وبدون وعود علاجية قطعية.
+قدم نصائح عملية قصيرة مناسبة للفئة المستهدفة.
+`;
+  const child = `الفئة: طفل. ركّز على اللطف، الحساسية، بساطة الروتين، وعدم الإفراط في المنتجات.`;
+  const adult = `الفئة: بالغ. قدّم روتينًا بسيطًا يناسب الشعر/البشرة بدون إفراط في الدعاية.`;
+  return `${core}\n${audience === 'adult' ? adult : child}`;
+}
+
+// ===== GPT call (GPT-5: only max_completion_tokens) =====
 async function callGPT({ persona, user, tokens = 300 }) {
   const isGpt5 = /^gpt-5/i.test(GPT_MODEL);
   const payload = {
     model: GPT_MODEL,
     messages: [
       { role: 'system', content: persona },
-      { role: 'user', content: user }
+      { role: 'user',   content: user }
     ]
   };
   if (isGpt5) payload.max_completion_tokens = Math.min(tokens, 500);
-  else {
-    payload.temperature = 0.65;
-    payload.max_tokens = Math.min(tokens, 500);
-  }
+  else { payload.temperature = 0.65; payload.max_tokens = Math.min(tokens, 500); }
 
   try {
     const { data } = await axios.post(OPENAI_API_URL, payload, {
@@ -239,34 +271,28 @@ async function callGPT({ persona, user, tokens = 300 }) {
   }
 }
 
-// --- Messenger send helpers ---
+// ===== Messenger helpers =====
 async function sendTypingOn(recipientId) {
   try {
     await axios.post(
       `https://graph.facebook.com/v17.0/me/messages?access_token=${PAGE_ACCESS_TOKEN}`,
       { recipient: { id: recipientId }, sender_action: 'typing_on' }
     );
-  } catch (e) {
-    console.error('Typing error:', e?.response?.data || e.message);
-  }
+  } catch (e) { console.error('Typing error:', e?.response?.data || e.message); }
 }
 
 async function sendReply(recipientId, replyContent) {
   try {
     const parts = String(replyContent || '').split('\n').filter(p => p.trim());
-    if (!parts.length) parts.push('تمام—قوليلي سن الطفل ونوع الشعر؟');
+    if (!parts.length) parts.push('احكيلي باختصار عايزة ايه علشان أساعدك ❤');
 
     for (const part of parts) {
       const isUrl = /^https?:\/\/\S+$/i.test(part.trim());
       if (isUrl) {
         await axios.post(
           `https://graph.facebook.com/v17.0/me/messages?access_token=${PAGE_ACCESS_TOKEN}`,
-          {
-            recipient: { id: recipientId },
-            message: {
-              attachment: { type: 'image', payload: { url: part.trim(), is_reusable: true } }
-            }
-          }
+          { recipient: { id: recipientId },
+            message: { attachment: { type: 'image', payload: { url: part.trim(), is_reusable: true } } } }
         );
       } else {
         for (const chunk of chunkText(part, 1800)) {
@@ -285,14 +311,8 @@ async function sendReply(recipientId, replyContent) {
 }
 
 function delay(ms){ return new Promise(r => setTimeout(r, ms)); }
-function chunkText(str, max=1800){
-  const s = String(str);
-  if (s.length <= max) return [s];
-  const out = [];
-  for (let i = 0; i < s.length; i += max) out.push(s.slice(i, i + max));
-  return out;
-}
+function chunkText(str, max=1800){ const s=String(str); if(s.length<=max) return [s]; const out=[]; for(let i=0;i<s.length;i+=max) out.push(s.slice(i,i+max)); return out; }
 
-// --- Start ---
+// ===== Start =====
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log(`🚀 SmartKidz bot on ${PORT} (model: ${GPT_MODEL})`));
