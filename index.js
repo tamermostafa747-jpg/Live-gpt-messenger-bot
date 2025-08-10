@@ -8,9 +8,11 @@ require('dotenv').config();
 const VERIFY_TOKEN      = process.env.VERIFY_TOKEN;
 const PAGE_ACCESS_TOKEN = process.env.PAGE_ACCESS_TOKEN;
 const OPENAI_API_KEY    = process.env.OPENAI_API_KEY;
-const OPENAI_API_URL    = 'https://api.openai.com/v1/chat/completions';
+// Prefer chat/completions; we’ll fall back to /responses on certain errors
+const OPENAI_CHAT_URL   = 'https://api.openai.com/v1/chat/completions';
+const OPENAI_RESP_URL   = 'https://api.openai.com/v1/responses';
 
-// Default to gpt-4o for more natural chat; you can override in env
+// Default to gpt-4o for the most natural chat; override in env if you want
 const GPT_MODEL         = process.env.GPT_MODEL || 'gpt-4o';
 
 const app = express();
@@ -26,10 +28,7 @@ app.get('/webhook', (req, res) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
   const challenge = req.query['hub.challenge'];
-
-  if (mode === 'subscribe' && token === VERIFY_TOKEN) {
-    return res.status(200).send(challenge);
-  }
+  if (mode === 'subscribe' && token === VERIFY_TOKEN) return res.status(200).send(challenge);
   return res.sendStatus(403);
 });
 
@@ -37,7 +36,7 @@ app.get('/webhook', (req, res) => {
 app.post('/webhook', (req, res) => {
   try {
     if (req.body.object !== 'page') return res.sendStatus(404);
-    res.sendStatus(200); // immediate ack to Meta
+    res.sendStatus(200); // immediate ack
 
     for (const entry of req.body.entry || []) {
       for (const event of entry.messaging || []) {
@@ -57,10 +56,8 @@ async function handleEvent(event) {
   const senderId   = event.sender?.id;
   const text       = event.message?.text || event.postback?.payload || '';
   const attachments = event.message?.attachments || [];
-
   if (!senderId) return;
 
-  // If only attachments came in, nudge user to send text
   if (!text.trim() && attachments.length) {
     await sendReply(senderId, 'لو تكتب سؤالك نصًا أقدر أرد عليك مباشرة 😊');
     return;
@@ -73,38 +70,69 @@ async function handleEvent(event) {
   await sendReply(senderId, reply || 'تمام.');
 }
 
-// === PURE GPT CALL (no persona/rules) ===
+// === PURE GPT CALL with fallback to /responses ===
 async function callGPTGeneric(userMessage) {
   const isGpt5 = /^gpt-5/i.test(GPT_MODEL);
 
-  const payload = {
+  // Primary payload for chat/completions
+  const chatPayload = {
     model: GPT_MODEL,
     messages: [{ role: 'user', content: userMessage }],
   };
-
-  // Param differences by family:
   if (isGpt5) {
-    // GPT-5: use max_completion_tokens; temperature is fixed
-    payload.max_completion_tokens = 450;
+    chatPayload.max_completion_tokens = 450; // GPT-5 style
   } else {
-    // GPT-4o / classic: max_tokens + temperature supported
-    payload.max_tokens = 450;
-    payload.temperature = 0.7;
+    chatPayload.max_tokens = 450;
+    chatPayload.temperature = 0.7;
   }
 
-  try {
-    const { data } = await axios.post(OPENAI_API_URL, payload, {
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-      },
-      timeout: 15000,
-    });
+  const headers = {
+    'Content-Type': 'application/json',
+    Authorization: `Bearer ${OPENAI_API_KEY}`,
+  };
 
+  try {
+    const { data } = await axios.post(OPENAI_CHAT_URL, chatPayload, { headers, timeout: 15000 });
     return (data.choices?.[0]?.message?.content || '').trim();
   } catch (e) {
-    console.error('OpenAI error:', e?.response?.data || e.message);
-    return 'حصلت مشكلة مؤقتًا—نجرب تاني؟';
+    // Log clear reason
+    const errMsg = e?.response?.data || e.message;
+    console.error('OpenAI chat/completions error:', errMsg);
+
+    // Conditions to try /responses:
+    const shouldFallback =
+      String(errMsg).includes('use /v1/responses') ||
+      String(errMsg).includes('model_not_found') ||
+      String(errMsg).includes('unsupported') ||
+      String(errMsg).includes('This model') && String(errMsg).includes('does not support');
+
+    if (!shouldFallback) {
+      return 'حصلت مشكلة مؤقتًا—نجرب تاني؟';
+    }
+
+    // Build a lean /responses payload
+    const respPayload = {
+      model: GPT_MODEL,
+      input: [{ role: 'user', content: userMessage }],
+    };
+    if (isGpt5) {
+      respPayload.max_output_tokens = 450; // /responses uses this name for some families
+    } else {
+      respPayload.temperature = 0.7;
+      respPayload.max_output_tokens = 450;
+    }
+
+    try {
+      const { data } = await axios.post(OPENAI_RESP_URL, respPayload, { headers, timeout: 15000 });
+      // /responses returns content in a different shape
+      const msg =
+        data?.output?.[0]?.content?.map?.(c => c.text || c)?.join('') ||
+        data?.choices?.[0]?.message?.content || '';
+      return String(msg || '').trim();
+    } catch (e2) {
+      console.error('OpenAI /responses error:', e2?.response?.data || e2.message);
+      return 'حصلت مشكلة مؤقتًا—نجرب تاني؟';
+    }
   }
 }
 
@@ -126,7 +154,6 @@ async function sendReply(recipientId, replyContent) {
     if (!parts.length) parts.push('تمام.');
 
     for (const part of parts) {
-      // Chunk text for Messenger’s limits (~2000 chars)
       for (const chunk of chunkText(part, 1800)) {
         await axios.post(
           `https://graph.facebook.com/v17.0/me/messages?access_token=${PAGE_ACCESS_TOKEN}`,
@@ -142,12 +169,11 @@ async function sendReply(recipientId, replyContent) {
 }
 
 // === UTILS ===
-function delay(ms) { return new Promise(r => setTimeout(r, ms)); }
-function chunkText(str, max = 1800) {
+function delay(ms){ return new Promise(r => setTimeout(r, ms)); }
+function chunkText(str, max=1800){
   const s = String(str);
   if (s.length <= max) return [s];
-  const out = [];
-  for (let i = 0; i < s.length; i += max) out.push(s.slice(i, i + max));
+  const out = []; for (let i=0;i<s.length;i+=max) out.push(s.slice(i,i+max));
   return out;
 }
 
