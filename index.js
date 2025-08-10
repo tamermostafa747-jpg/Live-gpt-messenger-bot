@@ -8,11 +8,11 @@ require('dotenv').config();
 const VERIFY_TOKEN      = process.env.VERIFY_TOKEN;
 const PAGE_ACCESS_TOKEN = process.env.PAGE_ACCESS_TOKEN;
 const OPENAI_API_KEY    = process.env.OPENAI_API_KEY;
-// Prefer chat/completions; we’ll fall back to /responses on certain errors
+
 const OPENAI_CHAT_URL   = 'https://api.openai.com/v1/chat/completions';
 const OPENAI_RESP_URL   = 'https://api.openai.com/v1/responses';
 
-// Default to gpt-4o for the most natural chat; override in env if you want
+// Default to gpt-4o (natural chat). You can override in Render or .env
 const GPT_MODEL         = process.env.GPT_MODEL || 'gpt-4o';
 
 const app = express();
@@ -53,11 +53,12 @@ app.post('/webhook', (req, res) => {
 async function handleEvent(event) {
   if (event.message && event.message.is_echo) return;
 
-  const senderId   = event.sender?.id;
-  const text       = event.message?.text || event.postback?.payload || '';
+  const senderId    = event.sender?.id;
+  const text        = event.message?.text || event.postback?.payload || '';
   const attachments = event.message?.attachments || [];
   if (!senderId) return;
 
+  // Attachment-only? Nudge to text.
   if (!text.trim() && attachments.length) {
     await sendReply(senderId, 'لو تكتب سؤالك نصًا أقدر أرد عليك مباشرة 😊');
     return;
@@ -66,24 +67,39 @@ async function handleEvent(event) {
 
   await sendTypingOn(senderId);
 
-  const reply = await callGPTGeneric(text);
+  const reply = await callGPTNatural(text);
   await sendReply(senderId, reply || 'تمام.');
 }
 
-// === PURE GPT CALL with fallback to /responses ===
-async function callGPTGeneric(userMessage) {
+// === Language helpers ===
+function looksArabic(s = '') {
+  return /[\u0600-\u06FF]/.test(String(s));
+}
+
+// === GPT CALL (Egyptian tone; fallback to /responses when needed) ===
+async function callGPTNatural(userMessage) {
+  const arabic = looksArabic(userMessage);
+
+  // Minimal, steady system prompt to keep replies natural & short.
+  const systemPrompt = arabic
+    ? 'اتكلم بالمصري بشكل بسيط ولطيف. خليك مختصر ومباشر. اسأل سؤال متابعة واحد بس لو محتاج توضيح. تجنّب أي وعود طبية قطعية.'
+    : 'Reply in the user’s language in a warm, natural, concise way. Ask at most one short follow-up if needed. Avoid definitive medical claims.';
+
   const isGpt5 = /^gpt-5/i.test(GPT_MODEL);
 
-  // Primary payload for chat/completions
+  // Primary payload for /chat/completions
   const chatPayload = {
     model: GPT_MODEL,
-    messages: [{ role: 'user', content: userMessage }],
+    messages: [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userMessage }
+    ],
   };
   if (isGpt5) {
-    chatPayload.max_completion_tokens = 450; // GPT-5 style
+    chatPayload.max_completion_tokens = 450; // GPT-5 family field; no temperature override
   } else {
-    chatPayload.max_tokens = 450;
     chatPayload.temperature = 0.7;
+    chatPayload.max_tokens = 450;
   }
 
   const headers = {
@@ -95,28 +111,26 @@ async function callGPTGeneric(userMessage) {
     const { data } = await axios.post(OPENAI_CHAT_URL, chatPayload, { headers, timeout: 15000 });
     return (data.choices?.[0]?.message?.content || '').trim();
   } catch (e) {
-    // Log clear reason
     const errMsg = e?.response?.data || e.message;
     console.error('OpenAI chat/completions error:', errMsg);
 
-    // Conditions to try /responses:
+    // Only then try /responses (some orgs/models require it)
     const shouldFallback =
-      String(errMsg).includes('use /v1/responses') ||
+      String(errMsg).includes('/v1/responses') ||
       String(errMsg).includes('model_not_found') ||
       String(errMsg).includes('unsupported') ||
-      String(errMsg).includes('This model') && String(errMsg).includes('does not support');
+      (String(errMsg).includes('This model') && String(errMsg).includes('does not support'));
 
-    if (!shouldFallback) {
-      return 'حصلت مشكلة مؤقتًا—نجرب تاني؟';
-    }
+    if (!shouldFallback) return 'حصلت مشكلة مؤقتًا—نجرب تاني؟';
 
-    // Build a lean /responses payload
+    // Lean payload for /responses
     const respPayload = {
       model: GPT_MODEL,
-      input: [{ role: 'user', content: userMessage }],
+      // For Responses API, we can pass a single string; tone hint stays minimal
+      input: `${systemPrompt}\n\nUser: ${userMessage}\nAssistant:`,
     };
     if (isGpt5) {
-      respPayload.max_output_tokens = 450; // /responses uses this name for some families
+      respPayload.max_output_tokens = 450;
     } else {
       respPayload.temperature = 0.7;
       respPayload.max_output_tokens = 450;
@@ -124,10 +138,12 @@ async function callGPTGeneric(userMessage) {
 
     try {
       const { data } = await axios.post(OPENAI_RESP_URL, respPayload, { headers, timeout: 15000 });
-      // /responses returns content in a different shape
+      // Try a few common shapes
       const msg =
         data?.output?.[0]?.content?.map?.(c => c.text || c)?.join('') ||
-        data?.choices?.[0]?.message?.content || '';
+        data?.choices?.[0]?.message?.content ||
+        data?.output_text ||
+        '';
       return String(msg || '').trim();
     } catch (e2) {
       console.error('OpenAI /responses error:', e2?.response?.data || e2.message);
@@ -136,7 +152,7 @@ async function callGPTGeneric(userMessage) {
   }
 }
 
-// === MESSENGER SEND HELPERS ===
+// === Messenger helpers ===
 async function sendTypingOn(recipientId) {
   try {
     await axios.post(
@@ -168,15 +184,18 @@ async function sendReply(recipientId, replyContent) {
   }
 }
 
-// === UTILS ===
+// === Utils ===
 function delay(ms){ return new Promise(r => setTimeout(r, ms)); }
 function chunkText(str, max=1800){
   const s = String(str);
   if (s.length <= max) return [s];
-  const out = []; for (let i=0;i<s.length;i+=max) out.push(s.slice(i,i+max));
+  const out = [];
+  for (let i = 0; i < s.length; i += max) out.push(s.slice(i, i + max));
   return out;
 }
 
 // === START ===
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`🚀 Passthrough GPT on ${PORT} (model: ${GPT_MODEL})`));
+app.listen(PORT, () =>
+  console.log(`🚀 Passthrough GPT on ${PORT} (model: ${GPT_MODEL})`)
+);
