@@ -1,3 +1,6 @@
 .env
 node_modules/
 *.log
+data/kb_index.json
+.vscode/
+npm-debug.log*
