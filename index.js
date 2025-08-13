@@ -1,42 +1,79 @@
-// npm i express body-parser axios dotenv
+// npm i express axios dotenv
 const express = require('express');
-const bodyParser = require('body-parser');
 const axios = require('axios');
+const crypto = require('crypto');
 require('dotenv').config();
 
-// === CONFIG ===
-const VERIFY_TOKEN      = process.env.VERIFY_TOKEN;
-const PAGE_ACCESS_TOKEN = process.env.PAGE_ACCESS_TOKEN;
-const OPENAI_API_KEY    = process.env.OPENAI_API_KEY;
+/* =========================
+   CONFIG
+========================= */
+const VERIFY_TOKEN       = process.env.VERIFY_TOKEN;
+const PAGE_ACCESS_TOKEN  = process.env.PAGE_ACCESS_TOKEN;
+const OPENAI_API_KEY     = process.env.OPENAI_API_KEY;
+const APP_SECRET         = process.env.APP_SECRET || ''; // optional (signature check)
+const GPT_MODEL          = process.env.GPT_MODEL || 'gpt-4o';
+const GRAPH_API_VERSION  = process.env.GRAPH_API_VERSION || 'v20.0';
+const GRAPH_BASE         = `https://graph.facebook.com/${GRAPH_API_VERSION}`;
 
-const OPENAI_CHAT_URL   = 'https://api.openai.com/v1/chat/completions';
-const OPENAI_RESP_URL   = 'https://api.openai.com/v1/responses';
+const OPENAI_CHAT_URL    = 'https://api.openai.com/v1/chat/completions';
+const OPENAI_RESP_URL    = 'https://api.openai.com/v1/responses';
 
-// Default to gpt-4o (natural chat). You can override in Render or .env
-const GPT_MODEL         = process.env.GPT_MODEL || 'gpt-4o';
+/* quick env sanity */
+if (!VERIFY_TOKEN)      console.warn('[WARN] VERIFY_TOKEN is missing.');
+if (!PAGE_ACCESS_TOKEN) console.warn('[WARN] PAGE_ACCESS_TOKEN is missing.');
+if (!OPENAI_API_KEY)    console.warn('[WARN] OPENAI_API_KEY is missing — replies will fall back.');
 
+/* =========================
+   APP/JSON PARSING
+========================= */
 const app = express();
-app.use(bodyParser.json());
-app.use(bodyParser.urlencoded({ extended: true }));
 
-// === HEALTH ===
+// keep raw body so we can validate X-Hub-Signature-256 if APP_SECRET provided
+app.use(express.json({
+  verify: (req, _res, buf) => { req.rawBody = buf; }
+}));
+app.use(express.urlencoded({ extended: true }));
+
+/* =========================
+   HEALTH
+========================= */
 app.get('/', (_req, res) => res.status(200).send('Bot online ✅'));
 app.get('/health', (_req, res) => res.status(200).json({ ok: true }));
 
-// === VERIFY WEBHOOK (Meta) ===
+/* =========================
+   VERIFY WEBHOOK (Meta)
+========================= */
 app.get('/webhook', (req, res) => {
-  const mode = req.query['hub.mode'];
-  const token = req.query['hub.verify_token'];
+  const mode      = req.query['hub.mode'];
+  const token     = req.query['hub.verify_token'];
   const challenge = req.query['hub.challenge'];
+
   if (mode === 'subscribe' && token === VERIFY_TOKEN) return res.status(200).send(challenge);
   return res.sendStatus(403);
 });
 
-// === MESSENGER WEBHOOK (ack first, process async) ===
+/* optional request signature check */
+function verifySignature(req) {
+  if (!APP_SECRET) return true; // skip if not configured
+  const signature = req.headers['x-hub-signature-256'];
+  if (!signature || !req.rawBody) return false;
+  const expected = 'sha256=' + crypto.createHmac('sha256', APP_SECRET).update(req.rawBody).digest('hex');
+  return signature === expected;
+}
+
+/* =========================
+   MESSENGER WEBHOOK
+========================= */
 app.post('/webhook', (req, res) => {
+  // Acknowledge first to avoid timeouts
+  res.sendStatus(200);
+
   try {
-    if (req.body.object !== 'page') return res.sendStatus(404);
-    res.sendStatus(200); // immediate ack
+    if (!verifySignature(req)) {
+      console.warn('[SECURITY] Invalid X-Hub-Signature-256');
+      return;
+    }
+    if (req.body.object !== 'page') return;
 
     for (const entry of req.body.entry || []) {
       for (const event of entry.messaging || []) {
@@ -50,7 +87,11 @@ app.post('/webhook', (req, res) => {
   }
 });
 
+/* =========================
+   EVENT HANDLER
+========================= */
 async function handleEvent(event) {
+  if (!event) return;
   if (event.message && event.message.is_echo) return;
 
   const senderId    = event.sender?.id;
@@ -67,40 +108,43 @@ async function handleEvent(event) {
 
   await sendTypingOn(senderId);
 
-  const reply = await callGPTNatural(text);
+  let reply;
+  try {
+    reply = await callGPTNatural(text);
+  } catch (e) {
+    console.error('callGPTNatural error:', e?.response?.data || e.message);
+  }
   await sendReply(senderId, reply || 'تمام.');
 }
 
-// === Language helpers ===
+/* =========================
+   GPT HELPERS
+========================= */
 function looksArabic(s = '') {
   return /[\u0600-\u06FF]/.test(String(s));
 }
 
-// === GPT CALL (Egyptian tone; fallback to /responses when needed) ===
 async function callGPTNatural(userMessage) {
-  const arabic = looksArabic(userMessage);
+  if (!OPENAI_API_KEY) {
+    // graceful fallback if key is missing
+    return 'الخدمة متوقفة مؤقتًا بسبب إعدادات النظام. جرّب لاحقًا من فضلك 🙏';
+  }
 
-  // Minimal, steady system prompt to keep replies natural & short.
+  const arabic = looksArabic(userMessage);
   const systemPrompt = arabic
-    ? 'اتكلم بالمصري بشكل بسيط ولطيف. خليك مختصر ومباشر. اسأل سؤال متابعة واحد بس لو محتاج توضيح. تجنّب أي وعود طبية قطعية.'
+    ? 'اتكلم بالمصري بشكل بسيط ولطيف. خليك مختصر ومباشر. اسأل سؤال متابعة واحد لو محتاج توضيح. تجنّب أي وعود طبية قطعية.'
     : 'Reply in the user’s language in a warm, natural, concise way. Ask at most one short follow-up if needed. Avoid definitive medical claims.';
 
   const isGpt5 = /^gpt-5/i.test(GPT_MODEL);
 
-  // Primary payload for /chat/completions
   const chatPayload = {
     model: GPT_MODEL,
     messages: [
       { role: 'system', content: systemPrompt },
       { role: 'user', content: userMessage }
     ],
+    ...(isGpt5 ? { max_completion_tokens: 450 } : { temperature: 0.7, max_tokens: 450 })
   };
-  if (isGpt5) {
-    chatPayload.max_completion_tokens = 450; // GPT-5 family field; no temperature override
-  } else {
-    chatPayload.temperature = 0.7;
-    chatPayload.max_tokens = 450;
-  }
 
   const headers = {
     'Content-Type': 'application/json',
@@ -112,9 +156,8 @@ async function callGPTNatural(userMessage) {
     return (data.choices?.[0]?.message?.content || '').trim();
   } catch (e) {
     const errMsg = e?.response?.data || e.message;
-    console.error('OpenAI chat/completions error:', errMsg);
+    console.error('OpenAI /chat/completions error:', errMsg);
 
-    // Only then try /responses (some orgs/models require it)
     const shouldFallback =
       String(errMsg).includes('/v1/responses') ||
       String(errMsg).includes('model_not_found') ||
@@ -123,22 +166,14 @@ async function callGPTNatural(userMessage) {
 
     if (!shouldFallback) return 'حصلت مشكلة مؤقتًا—نجرب تاني؟';
 
-    // Lean payload for /responses
     const respPayload = {
       model: GPT_MODEL,
-      // For Responses API, we can pass a single string; tone hint stays minimal
       input: `${systemPrompt}\n\nUser: ${userMessage}\nAssistant:`,
+      ...(isGpt5 ? { max_output_tokens: 450 } : { temperature: 0.7, max_output_tokens: 450 })
     };
-    if (isGpt5) {
-      respPayload.max_output_tokens = 450;
-    } else {
-      respPayload.temperature = 0.7;
-      respPayload.max_output_tokens = 450;
-    }
 
     try {
       const { data } = await axios.post(OPENAI_RESP_URL, respPayload, { headers, timeout: 15000 });
-      // Try a few common shapes
       const msg =
         data?.output?.[0]?.content?.map?.(c => c.text || c)?.join('') ||
         data?.choices?.[0]?.message?.content ||
@@ -152,11 +187,13 @@ async function callGPTNatural(userMessage) {
   }
 }
 
-// === Messenger helpers ===
+/* =========================
+   MESSENGER HELPERS
+========================= */
 async function sendTypingOn(recipientId) {
   try {
     await axios.post(
-      `https://graph.facebook.com/v17.0/me/messages?access_token=${PAGE_ACCESS_TOKEN}`,
+      `${GRAPH_BASE}/me/messages?access_token=${PAGE_ACCESS_TOKEN}`,
       { recipient: { id: recipientId }, sender_action: 'typing_on' }
     );
   } catch (e) {
@@ -172,7 +209,7 @@ async function sendReply(recipientId, replyContent) {
     for (const part of parts) {
       for (const chunk of chunkText(part, 1800)) {
         await axios.post(
-          `https://graph.facebook.com/v17.0/me/messages?access_token=${PAGE_ACCESS_TOKEN}`,
+          `${GRAPH_BASE}/me/messages?access_token=${PAGE_ACCESS_TOKEN}`,
           { recipient: { id: recipientId }, message: { text: chunk } }
         );
         await delay(120);
@@ -184,9 +221,11 @@ async function sendReply(recipientId, replyContent) {
   }
 }
 
-// === Utils ===
-function delay(ms){ return new Promise(r => setTimeout(r, ms)); }
-function chunkText(str, max=1800){
+/* =========================
+   UTILS
+========================= */
+function delay(ms) { return new Promise(r => setTimeout(r, ms)); }
+function chunkText(str, max = 1800) {
   const s = String(str);
   if (s.length <= max) return [s];
   const out = [];
@@ -194,8 +233,12 @@ function chunkText(str, max=1800){
   return out;
 }
 
-// === START ===
+/* =========================
+   START
+========================= */
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () =>
-  console.log(`🚀 Passthrough GPT on ${PORT} (model: ${GPT_MODEL})`)
-);
+app.listen(PORT, () => {
+  console.log(`🚀 Messenger bot running on ${PORT}`);
+  console.log(`   • Graph API: ${GRAPH_API_VERSION}`);
+  console.log(`   • Model: ${GPT_MODEL}`);
+});
