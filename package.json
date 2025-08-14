@@ -7,7 +7,6 @@
   "scripts": {
     "start": "node index.js",
     "build:index": "node scripts/build_index.js",
-    "postinstall": "node scripts/build_index.js || true"
   },
   "engines": {
     "node": ">=18"
