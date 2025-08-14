@@ -26,7 +26,8 @@ const OPENAI_EMB_URL     = 'https://api.openai.com/v1/embeddings';
 const KB_INDEX_PATH      = process.env.KB_INDEX_PATH || './data/kb_index.json';
 const EMBEDDINGS_MODEL   = process.env.EMBEDDINGS_MODEL || 'text-embedding-3-small';
 const TOP_K              = parseInt(process.env.TOP_K || '5', 10);
-const SIM_THRESHOLD      = parseFloat(process.env.SIM_THRESHOLD || '0.75');
+// default threshold a bit lower to improve recall; env overrides it
+const SIM_THRESHOLD      = parseFloat(process.env.SIM_THRESHOLD || '0.65');
 
 /* quick env sanity */
 if (!VERIFY_TOKEN)      console.warn('[WARN] VERIFY_TOKEN is missing.');
@@ -138,8 +139,8 @@ app.post('/webhook', (req, res) => {
     }
     if (req.body.object !== 'page') return;
 
-    for (const entry of req.body.entry || []) {
-      for (const event of entry.messaging || []) {
+    for (const entry of (req.body.entry || [])) {
+      for (const event of (entry.messaging || [])) {
         handleEvent(event).catch(err =>
           console.error('handleEvent error:', err?.response?.data || err.message)
         );
@@ -204,14 +205,14 @@ function formatKbContext(results, lang) {
   return `${head}\n${lines.join('\n')}`;
 }
 
-async function searchKB(query, lang) {
+async function searchKB(query /*, lang */) {
   if (!OPENAI_API_KEY || !KB.length) return [];
   try {
     const q = await embedText(query);
     const scored = KB.map(d => ({ d, s: cosineSim(q, d.embedding) }));
     scored.sort((a, b) => b.s - a.s);
-    // ✅ don't drop entries that lack explicit lang
-    return scored.filter(r => (!lang || !r.d.lang || r.d.lang === lang) && r.s >= SIM_THRESHOLD).slice(0, TOP_K);
+    // ✅ do not filter by lang; rely on similarity only
+    return scored.filter(r => r.s >= SIM_THRESHOLD).slice(0, TOP_K);
   } catch (e) {
     console.warn('[KB] search error:', e.message);
     return [];
@@ -226,8 +227,8 @@ async function callGPTNatural(userMessage) {
   const arabic = looksArabic(userMessage);
   const lang = arabic ? 'ar' : 'en';
   const systemPrompt = arabic
-    ? 'اتكلم بالمصري بشكل بسيط ولطيف. خليك مختصر ومباشر. اسأل سؤال متابعة واحد لو محتاج توضيح. تجنّب أي وعود طبية قطعية.'
-    : 'Reply in the user’s language in a warm, natural, concise way. Ask at most one short follow-up if needed. Avoid definitive medical claims.';
+    ? 'اتكلم بالمصري بشكل بسيط ولطيف. خليك مختصر ومباشر. اسأل سؤال متابعة واحد لو محتاج توضيح. اعتمد على معلومات المنتجات من قاعدة المعرفة لو موجودة، ومتخترعش معلومات.'
+    : 'Reply concisely in the user’s language. Prefer product facts from the knowledge base when available, and don’t invent information. Ask at most one brief follow-up if needed.';
 
   // === Retrieve KB context ===
   let kbContextMsg = null;
