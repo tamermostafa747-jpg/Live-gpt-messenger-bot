@@ -60,7 +60,8 @@ function loadKB() {
 
     KB = (docs || []).map((d, i) => {
       const text = d.text || d.content || d.meta?.text || '';
-      const lang = d.lang || d.meta?.lang || (/[\\u0600-\\u06FF]/.test(text) ? 'ar' : 'en');
+      // ✅ correct Arabic regex (no double escaping)
+      const lang = d.lang || d.meta?.lang || (/[\u0600-\u06FF]/.test(text) ? 'ar' : 'en');
       const embedding = d.embedding || d.vec || d.vector;
       const meta = d.meta || d;
       return Array.isArray(embedding) ? { text, lang, embedding, meta, i } : null;
@@ -86,7 +87,7 @@ const ALLOWED_ORIGINS = (process.env.WEBCHAT_ORIGINS || '')
 if (ALLOWED_ORIGINS.length === 0) {
   ALLOWED_ORIGINS.push('https://smartkidz-eg.com', 'https://www.smartkidz-eg.com');
 }
-app.use(cors({
+const corsOptions = {
   origin: (origin, cb) => {
     if (!origin) return cb(null, true);
     if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
@@ -94,7 +95,9 @@ app.use(cors({
   },
   methods: ['GET', 'POST'],
   allowedHeaders: ['Content-Type'],
-}));
+};
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions)); // ✅ allow preflight
 
 /* =========================
    HEALTH
@@ -207,7 +210,8 @@ async function searchKB(query, lang) {
     const q = await embedText(query);
     const scored = KB.map(d => ({ d, s: cosineSim(q, d.embedding) }));
     scored.sort((a, b) => b.s - a.s);
-    return scored.filter(r => (!lang || r.d.lang === lang) && r.s >= SIM_THRESHOLD).slice(0, TOP_K);
+    // ✅ don't drop entries that lack explicit lang
+    return scored.filter(r => (!lang || !r.d.lang || r.d.lang === lang) && r.s >= SIM_THRESHOLD).slice(0, TOP_K);
   } catch (e) {
     console.warn('[KB] search error:', e.message);
     return [];
