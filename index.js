@@ -14,7 +14,7 @@ const VERIFY_TOKEN       = process.env.VERIFY_TOKEN;
 const PAGE_ACCESS_TOKEN  = process.env.PAGE_ACCESS_TOKEN;
 const OPENAI_API_KEY     = process.env.OPENAI_API_KEY;
 const APP_SECRET         = process.env.APP_SECRET || ''; // optional (signature check)
-const GPT_MODEL          = process.env.GPT_MODEL || 'gpt-4o';
+const GPT_MODEL          = process.env.GPT_MODEL || 'gpt-4o-mini';
 const GRAPH_API_VERSION  = process.env.GRAPH_API_VERSION || 'v20.0';
 const GRAPH_BASE         = `https://graph.facebook.com/${GRAPH_API_VERSION}`;
 
@@ -26,13 +26,81 @@ const OPENAI_EMB_URL     = 'https://api.openai.com/v1/embeddings';
 const KB_INDEX_PATH      = process.env.KB_INDEX_PATH || './data/kb_index.json';
 const EMBEDDINGS_MODEL   = process.env.EMBEDDINGS_MODEL || 'text-embedding-3-small';
 const TOP_K              = parseInt(process.env.TOP_K || '5', 10);
-// default threshold a bit lower to improve recall; env overrides it
+// ↓ a bit looser to improve recall
 const SIM_THRESHOLD      = parseFloat(process.env.SIM_THRESHOLD || '0.65');
+
+// Marketing / Offers
+const OFFER_TEXT         = process.env.OFFER_TEXT || 'استفيد من عرضنا الحالي—خصم خاص لفترة محدودة. تحب أساعدك تطلبه دلوقتي؟';
 
 /* quick env sanity */
 if (!VERIFY_TOKEN)      console.warn('[WARN] VERIFY_TOKEN is missing.');
 if (!PAGE_ACCESS_TOKEN) console.warn('[WARN] PAGE_ACCESS_TOKEN is missing.');
 if (!OPENAI_API_KEY)    console.warn('[WARN] OPENAI_API_KEY is missing — replies will fall back.');
+
+/* =========================
+   SAFE REQUIRE (PRODUCT CATALOG)
+========================= */
+function safeRequire(p) { try { return require(p); } catch { return null; } }
+const CATALOG_RAW =
+  safeRequire('./src/productData.js') ||
+  safeRequire('./productData.js') ||
+  safeRequire(path.resolve(process.cwd(), 'src', 'productData.js')) ||
+  [];
+const CATALOG = Array.isArray(CATALOG_RAW)
+  ? CATALOG_RAW
+  : (Array.isArray(CATALOG_RAW?.default) ? CATALOG_RAW.default : []);
+
+/* Normalize catalog items so we can reference consistently */
+function normalizeItem(x = {}) {
+  const name =
+    x.name || x.title || x.productName || x.enName || x.arName || x.slug || 'منتج';
+  const desc = x.description || x.desc || x.details || '';
+  const tags = x.tags || x.ingredients || x.features || [];
+  const price = x.price || x.currentPrice || x.salePrice || '';
+  const size = x.size || x.quantity || x.weight || '';
+  const url  = x.url || x.link || x.href || '';
+  return { name: String(name), desc: String(desc), tags, price, size, url, raw: x };
+}
+
+/* Build concise catalog context; score by simple token overlap with the query */
+function buildCatalogContext(userMsg = '', lang = 'ar', limit = 8) {
+  if (!CATALOG.length) return null;
+  const items = CATALOG.map(normalizeItem);
+
+  const tokens = String(userMsg).toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+    .split(/\s+/).filter(Boolean);
+
+  function score(it) {
+    const hay = (it.name + ' ' + it.desc + ' ' + (Array.isArray(it.tags) ? it.tags.join(' ') : it.tags))
+      .toLowerCase();
+    let s = 0;
+    for (const t of tokens) if (hay.includes(t)) s++;
+    // slight boost for kids/hair keywords
+    if (hay.includes('شعر') || hay.includes('hair')) s += 1.2;
+    if (hay.includes('أطفال') || hay.includes('kids') || hay.includes('child')) s += 0.8;
+    return s;
+  }
+
+  const ranked = items
+    .map(it => ({ it, s: score(it) }))
+    .sort((a, b) => b.s - a.s);
+
+  const top = ranked.slice(0, limit).map(({ it, s }, i) => {
+    const parts = [];
+    parts.push(`[${i + 1}] ${it.name}`);
+    if (it.size) parts.push(`الحجم: ${it.size}`);
+    if (it.price) parts.push(`السعر: ${it.price}`);
+    if (Array.isArray(it.tags) && it.tags.length) parts.push(`ملفات/مكونات: ${it.tags.slice(0, 6).join(', ')}`);
+    if (it.url) parts.push(`لينك: ${it.url}`);
+    return parts.join(' • ');
+  });
+
+  const head = lang === 'ar'
+    ? 'ملخص سريع لمنتجاتنا (للرجوع فقط):'
+    : 'Quick summary of our products (for reference only):';
+  return `${head}\n${top.join('\n')}`;
+}
 
 /* =========================
    KB LOADING (vectors)
@@ -61,7 +129,6 @@ function loadKB() {
 
     KB = (docs || []).map((d, i) => {
       const text = d.text || d.content || d.meta?.text || '';
-      // ✅ correct Arabic regex (no double escaping)
       const lang = d.lang || d.meta?.lang || (/[\u0600-\u06FF]/.test(text) ? 'ar' : 'en');
       const embedding = d.embedding || d.vec || d.vector;
       const meta = d.meta || d;
@@ -94,11 +161,12 @@ const corsOptions = {
     if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
     return cb(new Error('CORS blocked for origin: ' + origin));
   },
-  methods: ['GET', 'POST'],
+  methods: ['GET', 'POST', 'OPTIONS'],
   allowedHeaders: ['Content-Type'],
+  credentials: true,
 };
 app.use(cors(corsOptions));
-app.options('*', cors(corsOptions)); // ✅ allow preflight
+app.options('*', cors(corsOptions)); // allow preflight
 
 /* =========================
    HEALTH
@@ -139,8 +207,8 @@ app.post('/webhook', (req, res) => {
     }
     if (req.body.object !== 'page') return;
 
-    for (const entry of (req.body.entry || [])) {
-      for (const event of (entry.messaging || [])) {
+    for (const entry of req.body.entry || []) {
+      for (const event of entry.messaging || []) {
         handleEvent(event).catch(err =>
           console.error('handleEvent error:', err?.response?.data || err.message)
         );
@@ -205,18 +273,26 @@ function formatKbContext(results, lang) {
   return `${head}\n${lines.join('\n')}`;
 }
 
-async function searchKB(query /*, lang */) {
+async function searchKB(query, lang) {
   if (!OPENAI_API_KEY || !KB.length) return [];
   try {
     const q = await embedText(query);
     const scored = KB.map(d => ({ d, s: cosineSim(q, d.embedding) }));
     scored.sort((a, b) => b.s - a.s);
-    // ✅ do not filter by lang; rely on similarity only
-    return scored.filter(r => r.s >= SIM_THRESHOLD).slice(0, TOP_K);
+    return scored.filter(r => (!lang || !r.d.lang || r.d.lang === lang) && r.s >= SIM_THRESHOLD).slice(0, TOP_K);
   } catch (e) {
     console.warn('[KB] search error:', e.message);
     return [];
   }
+}
+
+function injectCTA(answer, lang) {
+  const hasOfferWord = /عرض|خصم|offer|deal|promo/i.test(answer);
+  if (hasOfferWord) return answer;
+  const spacer = answer.trim().endsWith('؟') ? '\n' : '\n\n';
+  return answer + spacer + (lang === 'ar'
+    ? OFFER_TEXT
+    : (process.env.OFFER_TEXT_EN || 'Grab our current offer—limited-time discount. Want me to reserve it?'));
 }
 
 async function callGPTNatural(userMessage) {
@@ -226,9 +302,26 @@ async function callGPTNatural(userMessage) {
 
   const arabic = looksArabic(userMessage);
   const lang = arabic ? 'ar' : 'en';
-  const systemPrompt = arabic
-    ? 'اتكلم بالمصري بشكل بسيط ولطيف. خليك مختصر ومباشر. اسأل سؤال متابعة واحد لو محتاج توضيح. اعتمد على معلومات المنتجات من قاعدة المعرفة لو موجودة، ومتخترعش معلومات.'
-    : 'Reply concisely in the user’s language. Prefer product facts from the knowledge base when available, and don’t invent information. Ask at most one brief follow-up if needed.';
+
+  // Persona/system prompt tuned for children hair-care
+  const persona = arabic
+    ? [
+        'انت اخصائي/ة عناية بشعر الأطفال في SmartKidz.',
+        'اتكلم بالمصري بلُطف وثقة—مختصر، عملي، وخطوة بخطوة.',
+        'ركّز على مشاكل الشعر الشائعة عند الأطفال (جفاف، هيشان، تشابك، قشرة خفيفة، فروة حساسة).',
+        'اقترح منتجات من كتالوجنا فقط، واذكر سبب الاختيار وطريقة الاستخدام والسن المناسب وعدد المرات.',
+        'لو السؤال طبي بحت أو الأعراض شديدة، اطلب مراجعة طبيب أطفال/جلدية بدون تشخيص قطعي.',
+        'اسأل سؤال متابعة واحد فقط لو محتاج توضيح (مثال: سن الطفل، طبيعة الشعر، تكرار الغسيل).',
+        'لو فيه عرض حالي، افكر العميل بلُطف في الآخر.',
+      ].join(' ')
+    : [
+        'You are a children’s hair-care specialist for SmartKidz.',
+        'Speak warmly and concisely, focus on practical steps.',
+        'Recommend only items from our catalog, explain why, how to use, age-safety, and frequency.',
+        'If symptoms sound severe or medical, advise seeing a pediatrician/dermatologist (no diagnosis).',
+        'Ask at most one clarifying question if needed.',
+        'Gently mention the current offer at the end.',
+      ].join(' ');
 
   // === Retrieve KB context ===
   let kbContextMsg = null;
@@ -241,10 +334,15 @@ async function callGPTNatural(userMessage) {
     kbContextMsg = { role: 'system', content: ctxMsg };
   }
 
+  // Catalog context (lightweight)
+  const catalogCtx = buildCatalogContext(userMessage, lang, 8);
+  const catalogMsg = catalogCtx ? { role: 'system', content: catalogCtx } : null;
+
   const isGpt5 = /^gpt-5/i.test(GPT_MODEL);
   const messages = [
-    { role: 'system', content: systemPrompt },
+    { role: 'system', content: persona },
     ...(kbContextMsg ? [kbContextMsg] : []),
+    ...(catalogMsg ? [catalogMsg] : []),
     { role: 'user', content: userMessage }
   ];
 
@@ -252,9 +350,10 @@ async function callGPTNatural(userMessage) {
 
   // Try /chat/completions
   try {
-    const payload = { model: GPT_MODEL, messages, ...(isGpt5 ? { max_completion_tokens: 450 } : { temperature: 0.7, max_tokens: 450 }) };
-    const { data } = await axios.post(OPENAI_CHAT_URL, payload, { headers, timeout: 15000 });
-    return (data.choices?.[0]?.message?.content || '').trim();
+    const payload = { model: GPT_MODEL, messages, ...(isGpt5 ? { max_completion_tokens: 450 } : { temperature: 0.6, max_tokens: 450 }) };
+    const { data } = await axios.post(OPENAI_CHAT_URL, payload, { headers, timeout: 20000 });
+    const raw = (data.choices?.[0]?.message?.content || '').trim();
+    return injectCTA(raw || 'تمام.', lang);
   } catch (e) {
     const errMsg = e?.response?.data || e.message;
     console.error('OpenAI /chat/completions error:', errMsg);
@@ -270,13 +369,13 @@ async function callGPTNatural(userMessage) {
     // Fallback to /responses
     try {
       const joined = messages.map(m => `${m.role === 'system' ? 'System' : 'User'}: ${m.content}`).join('\n');
-      const resp = { model: GPT_MODEL, input: joined + '\nAssistant:', ...(isGpt5 ? { max_output_tokens: 450 } : { temperature: 0.7, max_output_tokens: 450 }) };
-      const { data } = await axios.post(OPENAI_RESP_URL, resp, { headers, timeout: 15000 });
+      const resp = { model: GPT_MODEL, input: joined + '\nAssistant:', ...(isGpt5 ? { max_output_tokens: 450 } : { temperature: 0.6, max_output_tokens: 450 }) };
+      const { data } = await axios.post(OPENAI_RESP_URL, resp, { headers, timeout: 20000 });
       const msg =
         data?.output?.[0]?.content?.map?.(c => c.text || c)?.join('') ||
         data?.choices?.[0]?.message?.content ||
         data?.output_text || '';
-      return String(msg || '').trim();
+      return injectCTA(String(msg || 'تمام.').trim(), lang);
     } catch (e2) {
       console.error('OpenAI /responses error:', e2?.response?.data || e2.message);
       return arabic ? 'حصلت مشكلة مؤقتًا—نجرب تاني؟' : 'Temporary issue—try again?';
@@ -348,4 +447,5 @@ app.listen(PORT, () => {
   console.log(`🚀 Messenger bot running on ${PORT}`);
   console.log(`   • Graph API: ${GRAPH_API_VERSION}`);
   console.log(`   • Model: ${GPT_MODEL}`);
+  if (CATALOG.length) console.log(`   • Catalog items: ${CATALOG.length}`);
 });
