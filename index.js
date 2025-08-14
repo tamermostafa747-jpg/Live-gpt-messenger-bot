@@ -1,7 +1,8 @@
-// npm i express axios dotenv
+// npm i express axios dotenv cors
 const express = require('express');
 const axios = require('axios');
 const crypto = require('crypto');
+const cors = require('cors');                 // <-- [NEW]
 require('dotenv').config();
 
 /* =========================
@@ -34,11 +35,36 @@ app.use(express.json({
 }));
 app.use(express.urlencoded({ extended: true }));
 
+/* ---------- CORS for website widget [NEW] ---------- */
+const ALLOWED_ORIGINS = (process.env.WEBCHAT_ORIGINS || '')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
+
+// If no env provided, default to Smart Kidz domain allowlist:
+if (ALLOWED_ORIGINS.length === 0) {
+  ALLOWED_ORIGINS.push('https://smartkidz-eg.com', 'https://www.smartkidz-eg.com');
+}
+
+app.use(cors({
+  origin: (origin, cb) => {
+    if (!origin) return cb(null, true); // allow curl/Render health checks
+    if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+    return cb(new Error('CORS blocked for origin: ' + origin));
+  },
+  methods: ['GET','POST'],
+  allowedHeaders: ['Content-Type']
+}));
+/* --------------------------------------------------- */
+
 /* =========================
    HEALTH
 ========================= */
 app.get('/', (_req, res) => res.status(200).send('Bot online ✅'));
 app.get('/health', (_req, res) => res.status(200).json({ ok: true }));
+
+/* Lightweight ping for webchat [NEW] */
+app.get('/webchat/ping', (_req, res) => res.json({ ok: true }));
 
 /* =========================
    VERIFY WEBHOOK (Meta)
@@ -220,6 +246,23 @@ async function sendReply(recipientId, replyContent) {
     console.error('Send error:', e?.response?.data || e.message);
   }
 }
+
+/* =========================
+   WEBSITE WEBCHAT ENDPOINTS  [NEW]
+========================= */
+// Minimal POST endpoint that reuses your GPT pipeline
+app.post('/webchat', async (req, res) => {
+  try {
+    const userText = (req.body?.text || '').toString().trim();
+    if (!userText) return res.status(400).json({ error: 'Missing text' });
+
+    const reply = await callGPTNatural(userText); // reuse existing logic
+    return res.json({ reply });
+  } catch (e) {
+    console.error('[/webchat] error:', e?.response?.data || e.message);
+    return res.status(500).json({ error: 'server_error' });
+  }
+});
 
 /* =========================
    UTILS
